@@ -150,6 +150,47 @@ async fn resolve_seeds_inner(
         }
     }
 
+    // ── v1.0.14: HTTPS-based last-resort fallback ────────────────────
+    //
+    // When both DNS and the hardcoded list are dead — e.g. an operator
+    // running an old binary after the fleet rotated, or an aggressive
+    // DNS-blocking network — try fetching a peer list from a stable
+    // HTTPS URL we control. The file at
+    // `https://coincync.network/.well-known/coincync-seeds.json` is
+    // (re)generated from fleet.toml whenever the fleet changes; a
+    // fresh node that can't reach DNS can still reach this URL and
+    // pick up a current seed list.
+    //
+    // We don't add this above the DNS path because:
+    //   - HTTPS-fallback is a "I'm desperate" signal; doing it first
+    //     would burn CDN bandwidth + reveal the node's IP to a third
+    //     party (a CDN edge node) on every restart, leaking metadata
+    //     the DNS path doesn't.
+    //   - DNS is cheaper, faster, and resolves cleanly when the
+    //     operator's setup is healthy.
+    //
+    // Skipped when a SOCKS5 proxy is active — HTTPS-over-SOCKS5 needs
+    // the proxy's HTTP handler and we don't pipe one in here; treat
+    // this as "Tor users opt out of HTTPS fallback" which is the
+    // correct privacy posture.
+    if addrs.is_empty() && !use_proxy_dns {
+        match fetch_https_seeds(network, port).await {
+            Ok(fetched) if !fetched.is_empty() => {
+                tracing::info!(
+                    "dns_seeds: HTTPS fallback returned {} peer(s)",
+                    fetched.len(),
+                );
+                addrs.extend(fetched);
+            }
+            Ok(_) => {
+                tracing::warn!("dns_seeds: HTTPS fallback returned an empty peer list");
+            }
+            Err(e) => {
+                tracing::warn!("dns_seeds: HTTPS fallback failed: {}", e);
+            }
+        }
+    }
+
     tracing::info!(
         "Resolved {} seed addresses for {} ({} DNS path)",
         addrs.len(),
@@ -157,4 +198,61 @@ async fn resolve_seeds_inner(
         if use_proxy_dns { "SOCKS5" } else { "OS" }
     );
     addrs
+}
+
+/// URL of the HTTPS-served seed-list fallback for `network`. Stable
+/// path; the JSON shape is documented in
+/// `docs/operations/dns-seed-fallback.md`.
+fn https_seeds_url(network: Network) -> &'static str {
+    match network {
+        Network::Mainnet => "https://coincync.network/.well-known/coincync-seeds-mainnet.json",
+        Network::Testnet => "https://coincync.network/.well-known/coincync-seeds-testnet.json",
+        Network::Regtest => "", // no public seeds for regtest
+    }
+}
+
+/// Fetch the HTTPS-published seed list and return parsed SocketAddrs.
+/// Returns Err for any network / parse failure — caller treats as
+/// "fallback unavailable".
+async fn fetch_https_seeds(
+    network: Network,
+    default_port: u16,
+) -> Result<Vec<SocketAddr>, Box<dyn std::error::Error + Send + Sync>> {
+    let url = https_seeds_url(network);
+    if url.is_empty() {
+        return Ok(vec![]);
+    }
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .user_agent(concat!("coincync-node/", env!("CARGO_PKG_VERSION")))
+        .build()?;
+
+    let resp = client.get(url).send().await?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()).into());
+    }
+
+    let body: serde_json::Value = resp.json().await?;
+    let peers = body.get("peers")
+        .and_then(|v| v.as_array())
+        .ok_or("response missing `peers` array")?;
+
+    let mut out = Vec::new();
+    for peer in peers {
+        let s = match peer.as_str() {
+            Some(s) => s,
+            None => continue,
+        };
+        // Accept "ip:port" verbatim, or bare "ip" (use network's default port).
+        let parsed = if s.contains(':') {
+            s.parse::<SocketAddr>().ok()
+        } else {
+            s.parse::<std::net::IpAddr>().ok().map(|ip| SocketAddr::new(ip, default_port))
+        };
+        if let Some(addr) = parsed {
+            out.push(addr);
+        }
+    }
+    Ok(out)
 }
