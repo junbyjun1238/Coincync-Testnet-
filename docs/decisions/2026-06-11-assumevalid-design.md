@@ -1,6 +1,8 @@
 # AssumeValid for CoinCync — design (DRAFT)
 
-**Status:** DRAFT — under collaborative design.
+**Status:** DRAFT — idea tiers LOCKED 2026-06-11 (section 8 short-list
+confirmed); section-7 decision points partially resolved by those
+selections; remaining open items called out below.
 **Authors:** ghostrider1092 + Claude.
 **Started:** 2026-06-11.
 **Targets:** v1.0.14 IBD-speedups track, item 2.
@@ -102,7 +104,7 @@ or a SEQUENCE of (height, hash) pairs? See decision point 8 below. -->
 
 ## 5. CLI surface
 
-```
+```text
 --assumevalid-hash <hex>     Override hardcoded hash (testing / custom networks)
 --no-assumevalid             Verify every block fully (paranoid / audit mode)
 --assumevalid-deep           Aggressive mode: skip BP+ and balance proof too
@@ -137,7 +139,10 @@ Bitcoin defaults to aggressive (skip everything). Are we okay being
 more conservative, accepting smaller speedups for the safety floor
 of keeping inflation checks?
 
-<!-- OPERATOR: -->
+**RESOLVED 2026-06-11 by ⭐ 8.14** (per-network defaults):
+testnet → aggressive default (faster iteration, lower stakes);
+mainnet → conservative default (safer floor). The single-default
+question is reframed as a per-network split.
 
 ### 7.2 Default disabled vs enabled at first release
 
@@ -145,21 +150,44 @@ If disabled, v1.0.14 ships with no actual speedup until constants
 get populated. Alternative: pick a testnet block height now (we have
 one running) and ship enabled.
 
-<!-- OPERATOR: -->
+**STILL OPEN.** Tier confirmation didn't resolve this. Three
+sub-options:
+
+  - **a.** Ship v1.0.14 disabled; populate constants in v1.0.15
+    after the v1.0.11-fleet branch has been in operation for
+    weeks. Safer; no speedup for v1.0.14 testers.
+  - **b.** Ship v1.0.14 enabled with a testnet constant taken from
+    the current local v1.0.11 chain's tip. Feature ships
+    self-demonstrating; risks shipping the wrong hash if v1.0.11
+    needs a re-spin.
+  - **c.** Ship the mechanism enabled with a deliberately-stale
+    AV (say H=100, well-mined-over) — proves the mechanism works
+    end-to-end on real chain history without anchoring to a tip
+    that might shift.
+
+My instinct: **(c)** — proves the mechanism, doesn't bake in a
+hash that could turn out wrong. <!-- OPERATOR: pick a/b/c -->
 
 ### 7.3 `--assumevalid-deep` as opt-in flag
 
 vs always-on aggressive (Bitcoin style). Operator who wants safety
 floors must explicitly opt out.
 
-<!-- OPERATOR: -->
+**PARTIALLY RESOLVED 2026-06-11 by ⭐ 8.14.** Per-network default
+means the flag's *role* depends on which network you're on. On
+testnet, it's redundant (default already aggressive). On mainnet,
+it's the opt-in for aggressive mode. Net: the flag exists for
+mainnet operator use; on testnet it's a no-op.
 
 ### 7.4 Hard hash-mismatch abort vs warn-and-continue
 
 Bitcoin warns. I'm proposing abort because "you're on a fork without
 realizing it" is a worse outcome for a privacy chain.
 
-<!-- OPERATOR: -->
+**STILL OPEN.** Not implicitly resolved by section-8 selections.
+My recommendation stands: hard abort + privacy-aware error
+message that doesn't leak which peer fed the bad data (per §10.4).
+<!-- OPERATOR: confirm hard-abort, or flip to warn-and-continue? -->
 
 ### 7.5 Activation height for the initial testnet AssumeValid value
 
@@ -167,13 +195,21 @@ Do you want to anchor to the current local v1.0.11 chain at some
 recent height, or wait until the public testnet has soaked for N
 days post-v1.0.11-release?
 
-<!-- OPERATOR: -->
+**DEFERRED until 7.2 is resolved** (a/b/c above). If 7.2 lands on
+**a**, this question doesn't apply yet. If on **b**, we need the
+hash of a current testnet tip. If on **c**, we just pick H=100
+or similar. <!-- OPERATOR: comes into focus once 7.2 is picked -->
 
 ### 7.6 Should `--assumevalid-deep` even exist for v1.0.14?
 
 vs ship just the conservative-only path and add aggressive later.
 
-<!-- OPERATOR: -->
+**RESOLVED 2026-06-11 by ⭐ 8.14** (per-network defaults):
+aggressive mode is the testnet DEFAULT, which means it has to
+exist. The `--assumevalid-deep` flag becomes meaningful on
+mainnet, where it's an opt-in override of the conservative
+default. The flag also becomes the testnet opt-out for "I want
+mainnet-level safety even on testnet."
 
 ### 7.7 Snapshot ↔ AssumeValid coupling
 
@@ -191,7 +227,12 @@ than the trust assumption for a snapshot ("this URL host gave me a
 chain I can resync from"). Mixing them weakens the AssumeValid
 floor.
 
-<!-- OPERATOR: -->
+**RESOLVED 2026-06-11 by ⭐ 8.10** (snapshot tip declares an AV
+hint): we couple, but only by treating the snapshot's tip as a
+PER-INSTALL effective AV, not a project-level AV. Hardcoded
+constants are unaffected. A user who already trusted the snapshot
+URL gets the historical-verification skip naturally without
+forcing the project-level trust floor to weaken.
 
 ### 7.8 Single hash vs sequence of checkpoint hashes
 
@@ -199,7 +240,13 @@ Instead of a single AssumeValid hash, ship a sequence of
 (height, hash) pairs. More expensive in code but harder for an
 attacker to forge a chain that matches at exactly one point.
 
-<!-- OPERATOR: -->
+**RESOLVED 2026-06-11 by ⭐ 8.4 + 8.15** (sliding-window +
+append-only ratchet): the data structure becomes a sequence of
+checkpoints (8.15 append-only ratchet), AND the trusted window
+slides forward as the chain grows (8.4 sliding-window). Each
+release appends; never modifies. Combined effect: the chain is
+anchored at multiple historic heights AND every binary picks up
+trust for blocks `tip − K` regardless of release age.
 
 ### 7.9 Anything else I haven't surfaced?
 
