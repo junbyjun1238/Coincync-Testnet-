@@ -137,6 +137,36 @@ enum Command {
     /// GitHub and intermediaries on every restart. Running this
     /// subcommand explicitly is informed-consent update checking.
     CheckUpdate,
+    /// Download and extract a published chaindata snapshot into the
+    /// data directory. IBD speedup for fresh nodes — saves the cost
+    /// of validating every block from genesis when an honest peer's
+    /// recent chaindata is available out-of-band.
+    ///
+    /// Trust model: the URL host is the trust anchor. The fetcher
+    /// verifies SHA256 against a sidecar `.sha256` file at the same
+    /// URL stem; integrity tampering is caught. A malicious URL host
+    /// can still serve a chain that isn't the canonical one — but
+    /// the node validates every block AFTER the snapshot's tip
+    /// against consensus rules, so any fork the snapshot lands on
+    /// can only persist if the peer fleet also agrees with it.
+    ///
+    /// Refuses to extract over an existing chaindata directory unless
+    /// `--force` is passed. The data dir is wiped before extraction
+    /// to avoid mixing snapshot state with pre-existing state.
+    SnapshotFetch {
+        /// URL of the published snapshot (tar.gz).
+        /// The fetcher also requests `<url>.sha256` for verification.
+        url: String,
+        /// Allow overwriting an existing chaindata directory.
+        #[arg(long)]
+        force: bool,
+        /// Skip SHA256 verification. NOT recommended; use only when
+        /// the sidecar file is known unavailable (e.g. an operator
+        /// served a snapshot without one and you've verified it
+        /// out-of-band).
+        #[arg(long)]
+        no_verify: bool,
+    },
 }
 
 // SECURITY (runtime resilience): force at least 4 worker threads regardless of
@@ -221,6 +251,9 @@ async fn main() {
         Command::PrintGenesisHash => print_genesis_hash(network),
         Command::Status => show_status(network, &data_dir).await,
         Command::IbdStatus { rpc_url } => ibd_status(network, rpc_url).await,
+        Command::SnapshotFetch { url, force, no_verify } => {
+            snapshot_fetch(network, &data_dir, &url, force, no_verify).await
+        }
         Command::CheckUpdate => check_update().await,
         Command::Start => {
             if let Err(e) = start_node(
@@ -562,6 +595,160 @@ async fn ibd_status(network: Network, rpc_url: Option<String>) {
         else { "" }
     );
     println!("Difficulty:   {}", difficulty);
+}
+
+/// `coincync-node snapshot-fetch <URL>` — download + verify + extract.
+///
+/// v1.0.14 IBD speedup: a fresh node downloads a published chaindata
+/// tarball from a trusted URL, verifies its SHA256, and extracts it
+/// into the data dir. After this, `start` opens the prepared chaindata
+/// and begins normal sync from the snapshot's tip — saving the cost
+/// of validating every block from genesis.
+///
+/// Trust model: the URL host is the trust anchor. SHA256 catches
+/// tampering; the metadata sidecar catches network / chain
+/// mismatches. A malicious URL host can still serve a chain that
+/// isn't canonical, but post-extraction the node validates every new
+/// block against consensus rules — any fork the snapshot lands on
+/// only persists if the peer mesh also agrees.
+async fn snapshot_fetch(
+    network: Network,
+    data_dir: &PathBuf,
+    url: &str,
+    force: bool,
+    no_verify: bool,
+) {
+    use sha2::{Digest, Sha256};
+
+    let chaindata_dir = data_dir.join(match network {
+        Network::Mainnet => "mainnet",
+        Network::Testnet => "testnet",
+        Network::Regtest => "regtest",
+    });
+
+    // ── Pre-flight: refuse to overwrite without --force ────────────
+    if chaindata_dir.exists()
+        && chaindata_dir.read_dir().map(|mut e| e.next().is_some()).unwrap_or(false)
+    {
+        if !force {
+            eprintln!("Refusing to extract over existing chaindata at {:?}.", chaindata_dir);
+            eprintln!("Pass --force to wipe + replace.");
+            std::process::exit(1);
+        }
+        eprintln!("--force: wiping existing chaindata at {:?}", chaindata_dir);
+        if let Err(e) = std::fs::remove_dir_all(&chaindata_dir) {
+            eprintln!("Failed to wipe {:?}: {}", chaindata_dir, e);
+            std::process::exit(1);
+        }
+    }
+
+    // ── Download tarball + sidecar SHA256 ──────────────────────────
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(900)) // 15-min for chunky downloads
+        .user_agent(concat!("coincync-node/", env!("CARGO_PKG_VERSION")))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to build HTTP client: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("Downloading {} …", url);
+    let tarball_bytes = match client.get(url).send().await {
+        Ok(r) if r.status().is_success() => match r.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Failed reading tarball body: {}", e);
+                std::process::exit(1);
+            }
+        },
+        Ok(r) => {
+            eprintln!("HTTP {} from {}", r.status(), url);
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("GET {} failed: {}", url, e);
+            std::process::exit(1);
+        }
+    };
+    eprintln!("  {} bytes downloaded", tarball_bytes.len());
+
+    // ── Verify SHA256 against sidecar ──────────────────────────────
+    if !no_verify {
+        let sha_url = format!("{}.sha256", url);
+        eprintln!("Fetching {} for integrity check …", sha_url);
+        let expected = match client.get(&sha_url).send().await {
+            Ok(r) if r.status().is_success() => match r.text().await {
+                Ok(s) => {
+                    // sha256sum format is "<hex>  <filename>" — take the first whitespace-separated token.
+                    s.split_whitespace().next().unwrap_or("").to_string()
+                }
+                Err(e) => {
+                    eprintln!("Failed reading sidecar SHA256: {}", e);
+                    std::process::exit(1);
+                }
+            },
+            Ok(r) => {
+                eprintln!("HTTP {} fetching sidecar SHA256 ({})", r.status(), sha_url);
+                eprintln!("Pass --no-verify only if you've verified the tarball out-of-band.");
+                std::process::exit(1);
+            }
+            Err(e) => {
+                eprintln!("Failed fetching sidecar SHA256: {}", e);
+                eprintln!("Pass --no-verify only if you've verified the tarball out-of-band.");
+                std::process::exit(1);
+            }
+        };
+
+        let actual = {
+            let mut hasher = Sha256::new();
+            hasher.update(&tarball_bytes);
+            hex::encode(hasher.finalize())
+        };
+        if !actual.eq_ignore_ascii_case(&expected) {
+            eprintln!("SHA256 mismatch.");
+            eprintln!("  expected (sidecar): {}", expected);
+            eprintln!("  actual   (computed): {}", actual);
+            eprintln!("Tarball was modified in transit OR the sidecar is for a different file.");
+            eprintln!("Refusing to extract — re-download or verify out-of-band.");
+            std::process::exit(1);
+        }
+        eprintln!("  SHA256 verified: {}", actual);
+    } else {
+        eprintln!("--no-verify: skipping SHA256 check (operator's responsibility).");
+    }
+
+    // ── Extract into data_dir ──────────────────────────────────────
+    eprintln!("Extracting into {:?} …", data_dir);
+    if let Err(e) = std::fs::create_dir_all(data_dir) {
+        eprintln!("Failed to create data dir {:?}: {}", data_dir, e);
+        std::process::exit(1);
+    }
+    let gz = flate2::read::GzDecoder::new(&tarball_bytes[..]);
+    let mut archive = tar::Archive::new(gz);
+    archive.set_preserve_permissions(true);
+    if let Err(e) = archive.unpack(data_dir) {
+        eprintln!("Failed to extract tarball: {}", e);
+        eprintln!("Data dir may be in an inconsistent state — remove and retry.");
+        std::process::exit(1);
+    }
+
+    eprintln!();
+    eprintln!("Snapshot extracted. Start the node with:");
+    eprintln!();
+    eprintln!("    coincync-node --network {} --data-dir {:?} start",
+        match network {
+            Network::Mainnet => "mainnet",
+            Network::Testnet => "testnet",
+            Network::Regtest => "regtest",
+        },
+        data_dir,
+    );
+    eprintln!();
+    eprintln!("On first start the node will resume sync from the snapshot's tip and");
+    eprintln!("validate every subsequent block against consensus rules normally.");
 }
 
 async fn start_node(

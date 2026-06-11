@@ -110,7 +110,14 @@ http-body-util = "0.1"
 bytes      = "1"
 hyper      = { version = "1", features = ["full"] }
 axum       = { version = "0.7", features = ["ws"] }
-reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest    = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
+
+# v1.0.14: used by the `snapshot fetch` subcommand to download and
+# extract a published chaindata tarball as an IBD speedup. Pure-Rust
+# implementations so no external `tar` / `gzip` binary is required
+# (works the same on Linux / macOS / native Windows).
+tar        = "0.4"
+flate2     = "1"
 
 # â”€â”€ Networking â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 hickory-resolver = "0.26"
