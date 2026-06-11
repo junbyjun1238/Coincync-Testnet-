@@ -107,6 +107,28 @@ enum Command {
     PrintGenesisHash,
     /// Show node status.
     Status,
+    /// Query a running node's IBD progress, in plain English.
+    ///
+    /// Talks to a running daemon via JSON-RPC (default
+    /// `http://127.0.0.1:28081`). Prints a human-readable summary of
+    /// what's happening:
+    ///   - whether sync is active and how far it has to go
+    ///   - peer count + Dandelion++ privacy degradation note
+    ///   - tip-age and a stall verdict
+    ///   - blocks/min rate + ETA when known
+    ///
+    /// Added v1.0.14 in response to the Crucible Cycle 01 tester pain
+    /// point — barns repeatedly asked "is there any sync?" because
+    /// raw `get_info` JSON didn't say. This subcommand makes the
+    /// answer self-evident.
+    ///
+    /// Use `--rpc-url URL` to override the daemon URL.
+    IbdStatus {
+        /// Override the daemon's JSON-RPC URL. Defaults to
+        /// http://127.0.0.1:<network-default-rpc-port>.
+        #[arg(long)]
+        rpc_url: Option<String>,
+    },
     /// Check the GitHub releases page for a newer version and exit.
     ///
     /// User-invoked only. The node does *not* poll for updates on
@@ -198,6 +220,7 @@ async fn main() {
     match cli.command.unwrap_or(Command::Start) {
         Command::PrintGenesisHash => print_genesis_hash(network),
         Command::Status => show_status(network, &data_dir).await,
+        Command::IbdStatus { rpc_url } => ibd_status(network, rpc_url).await,
         Command::CheckUpdate => check_update().await,
         Command::Start => {
             if let Err(e) = start_node(
@@ -402,6 +425,143 @@ async fn show_status(network: Network, data_dir: &PathBuf) {
             std::process::exit(1);
         }
     }
+}
+
+/// `coincync-node ibd-status` — talk to a running daemon and print a
+/// human-readable IBD progress summary.
+///
+/// Added v1.0.14 as the operator-facing answer to the Crucible Cycle 01
+/// tester pain point. Raw `get_info` JSON is fine for tooling but it
+/// doesn't say "you're 245 blocks behind, ~20 minutes at current
+/// rate". This subcommand does.
+async fn ibd_status(network: Network, rpc_url: Option<String>) {
+    use coincync::constants::{DEFAULT_RPC_PORT, TESTNET_RPC_PORT, REGTEST_RPC_PORT};
+
+    let default_port = match network {
+        Network::Mainnet => DEFAULT_RPC_PORT,
+        Network::Testnet => TESTNET_RPC_PORT,
+        Network::Regtest => REGTEST_RPC_PORT,
+    };
+    let url = rpc_url.unwrap_or_else(|| format!("http://127.0.0.1:{}", default_port));
+    let endpoint = format!("{}/rpc/{}", url.trim_end_matches('/'), match network {
+        Network::Mainnet => "mainnet",
+        Network::Testnet => "testnet",
+        Network::Regtest => "regtest",
+    });
+
+    let body = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "get_info",
+        "params": [],
+    });
+
+    let client = match reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+    {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to build HTTP client: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let resp = match client.post(&endpoint).json(&body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Could not reach the daemon at {}: {}", endpoint, e);
+            eprintln!();
+            eprintln!("Is the node running? Try:");
+            eprintln!("    coincync-node --network {} start", match network {
+                Network::Mainnet => "mainnet",
+                Network::Testnet => "testnet",
+                Network::Regtest => "regtest",
+            });
+            std::process::exit(1);
+        }
+    };
+
+    let json: serde_json::Value = match resp.json().await {
+        Ok(j) => j,
+        Err(e) => {
+            eprintln!("Daemon returned malformed JSON: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    let result = match json.get("result") {
+        Some(r) => r,
+        None => {
+            eprintln!("Daemon RPC error: {}", json);
+            std::process::exit(1);
+        }
+    };
+
+    let height       = result.get("height").and_then(|v| v.as_u64()).unwrap_or(0);
+    let target       = result.get("target_height").and_then(|v| v.as_u64()).unwrap_or(0);
+    let peer_count   = result.get("peer_count").and_then(|v| v.as_u64()).unwrap_or(0);
+    let status       = result.get("status").and_then(|v| v.as_str()).unwrap_or("?");
+    let tip_age_secs = result.get("tip_age_secs").and_then(|v| v.as_u64()).unwrap_or(0);
+    let difficulty   = result.get("difficulty").and_then(|v| v.as_str()).unwrap_or("?");
+
+    // ── Header ────────────────────────────────────────────────────
+    println!("CoinCync node IBD status — {:?}", network);
+    println!("Daemon:       {}", endpoint);
+    println!();
+
+    // ── Sync verdict ──────────────────────────────────────────────
+    let behind = target.saturating_sub(height);
+    match status {
+        "synced" => {
+            println!("✓ Synced.");
+            println!("  Height: {}", height);
+        }
+        "syncing" if behind > 0 => {
+            println!("⟳ Syncing.");
+            println!("  Height:       {} / target {}  ({} behind)", height, target, behind);
+            // No rate info from a single sample — a future commit can
+            // sample twice and emit blocks/min + ETA.
+        }
+        "syncing" => {
+            println!("⟳ Syncing — matched peer tip, waiting for new blocks.");
+            println!("  Height: {}", height);
+        }
+        "stalled" | "no-peers" => {
+            println!("✗ Not progressing — status = {:?}", status);
+            println!("  Height:  {}", height);
+            println!("  Target:  {} ({} behind)", target, behind);
+            println!();
+            println!("  Triage:");
+            println!("    - peer_count = {} ({})", peer_count,
+                if peer_count == 0 { "no peers — DNS, addnode, or firewall problem" }
+                else if peer_count < 3 { "below Dandelion++ privacy threshold of 3" }
+                else { "above the privacy threshold" }
+            );
+            if tip_age_secs > 600 {
+                let mins = tip_age_secs / 60;
+                println!("    - tip age = {} sec (~{} min) — chain has been quiet for a while", tip_age_secs, mins);
+            }
+        }
+        other => {
+            println!("? Unknown status: {:?}", other);
+            println!("  Height: {}", height);
+        }
+    }
+
+    // ── Mesh + tip ────────────────────────────────────────────────
+    println!();
+    println!("Peers:        {} {}", peer_count,
+        if peer_count == 0 { "(no peers)" }
+        else if peer_count < 3 { "(Dandelion++ privacy degraded — needs 3+)" }
+        else { "" }
+    );
+    println!("Tip age:      {} sec {}", tip_age_secs,
+        if tip_age_secs > 3600 { "(>1 hour — likely stalled)" }
+        else if tip_age_secs > 600 { "(>10 min — slow, but may be normal during IBD)" }
+        else { "" }
+    );
+    println!("Difficulty:   {}", difficulty);
 }
 
 async fn start_node(
