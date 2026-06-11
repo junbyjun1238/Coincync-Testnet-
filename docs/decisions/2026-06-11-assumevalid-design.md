@@ -207,30 +207,178 @@ attacker to forge a chain that matches at exactly one point.
 
 ---
 
-## 8. Operator-added designs
+## 8. Idea bucket — 17 design variants for review
 
-This section is reserved for design ideas that don't fit the
-sections above. Add anything here in any form — bullet points,
-free-form prose, code sketches, half-baked thoughts. We'll fold
-them into the structure once we see what shape they're.
+Captured 2026-06-11 from a brainstorm pass. Each idea is described
+in two-to-four sentences: what it is, what it buys, what it costs.
+The recommendation column captures which ideas I think are worth
+folding into the v1.0.14 mechanism vs which are speculative /
+future-CIP material. Decision on each lands in section 7 above
+once the operator weighs in.
 
-The only thing that matters at this stage is capturing the ideas.
-Don't worry about scope: some might belong in AssumeValid; some
-might be their own CIP; some might be v1.0.15 / v2.0 territory.
-We'll sort after.
+Status legend:
+  ⭐ = strong recommendation, fold into v1.0.14
+  ◐ = worth doing, possibly v1.0.15
+  ○ = speculative, may belong in its own CIP
 
-### 8.1 [your idea here]
+### Trust-model alternatives
 
-<!-- OPERATOR: drop ideas — single thread of consciousness or
-bullet list, whichever's natural. -->
+**8.1 ⭐ Multi-source consensus checkpoint.** Instead of one
+hardcoded hash, fetch *published* (height, hash) tuples from N
+independent sources at startup (peer gossip + `.well-known` + a
+maintainer-signed manifest). Require k-of-n agreement before
+activating AssumeValid. *Cost:* more code, slower startup. *Buys:*
+no single point of trust failure. *CoinCync angle:* the published
+sources can reuse the same `.well-known/` infrastructure we built
+for DNS-seed fallback in `7b003b0` — same trust anchor, same
+operational footprint.
 
-### 8.2 [your idea here]
+**8.2 ◐ Maintainer-signed checkpoint manifest.** Ship a maintainer
+pubkey in the binary; fetch `.well-known/coincync-checkpoints.json`
+(signed); verify signature before trusting. *Buys:* compromised CDN
+can't poison checkpoints. *CoinCync angle:* couples to the existing
+`MAINTAINERS.md` bus-factor framework — checkpoint-signing is a
+natural maintainer responsibility we'd add to the role description.
 
-<!-- OPERATOR: -->
+**8.3 ○ Time-locked checkpoint.** A checkpoint published at T₀
+becomes trustable only at T₀ + 14 days. *Buys:* network reaction
+window — if a checkpoint is wrong, somebody notices and shouts
+before binaries start trusting it. *Cost:* slightly inconvenient
+for fresh installs in the first 2 weeks of a release.
 
-### 8.3 [your idea here]
+### Mechanism variants
 
-<!-- OPERATOR: -->
+**8.4 ⭐ Sliding-window AssumeValid.** Instead of a single fixed
+height, the trusted window is `tip − K` blocks. *Buys:* an
+out-of-date node STILL benefits because its window slides forward
+as it catches up; avoids the "AV constant goes stale between
+releases" problem. *Math:* K=10,000 means anything older than ~3.5
+days at 30s blocks gets the speedup. *CoinCync angle:* combines
+naturally with our 30-second block time — the math gives natural
+units (days, not just block heights).
+
+**8.5 ○ Layered crypto skipping by depth.** Per-transaction
+decision: based on the tx's depth from tip, skip CLSAG (deepest),
+skip BP+ (very deep), skip balance proof (only at the assumevalid
+floor). Smooth fade-in rather than binary on/off. *Cost:* more
+complex. *Buys:* matches "trust scales with how settled the block
+is" intuition.
+
+**8.6 ◐ Coinbase-only skipping.** Below AV, skip validation **only
+for coinbase txs** (no ring sigs, no BP+ on those by definition).
+*Buys:* tiny speedup, ~zero attack surface — coinbase structure
+is heavily restricted. *Use:* a minimal "let's get the mechanism
+shipped" version. Good prototype before expanding to general
+skipping.
+
+**8.7 ○ Probabilistic spot-check.** Even below AV, randomly
+fully-verify 1 in N blocks. *Buys:* statistical detection of forged
+chains — if even 1% of below-AV blocks get audited, a tampered
+chain shows up quickly. *Cost:* speedup is (N-1)/N. The check is
+invisible to the operator and cheap to add.
+
+### Privacy-specific (CoinCync-unique)
+
+**8.8 ⭐ Key-image uniqueness ALWAYS verified, even below AV.**
+Even if we skip ring signature math, key-image-unique check is what
+defines double-spend prevention. *Cost:* sub-microsecond per
+lookup. *Defensible posture:* "we skip the crypto-math-proof of
+ownership but still enforce the no-double-spend property at the
+database level." *CoinCync angle:* this is fundamentally a
+privacy-chain concept that has no Bitcoin equivalent — Bitcoin's
+double-spend prevention comes from signature verification itself,
+ours comes from key-image set membership, so they decouple in
+ways Bitcoin's design doesn't.
+
+**8.9 ○ Curve-point sanity ALWAYS verified, even below AV.**
+Stealth output P, key images, commitments — verifying they're
+on-curve is sub-microsecond per element. Skipping doesn't help
+speed but keeping it catches "obvious garbage" early. *Worth
+keeping for defense in depth.*
+
+### Integration with what we've already shipped
+
+**8.10 ⭐ Snapshot tip declares an AssumeValid hint.** The
+`snapshot-fetch` metadata JSON (see `e127a01`) includes a
+`(tip_height, tip_hash)` pair. After extraction, the node uses
+that as its effective AssumeValid — for THIS chain only, for THIS
+install. *Buys:* couples cleanly — a user who trusted the snapshot
+URL has already accepted the trust assumption.
+
+**8.11 ◐ AssumeValid as snapshot precondition.** Refuse
+`snapshot-fetch` if the snapshot's tip is BELOW the hardcoded
+AssumeValid. *Buys:* prevents downgrade attacks via stale-but-
+correct snapshots. Makes AV the floor for what snapshots can
+advertise.
+
+**8.12 ⭐ AV health visible on `ibd-status`.** The diagnostic
+subcommand from `48faf06` gets a new line: "AssumeValid: enabled
+@ H=14328 (verified ✓)" or "AssumeValid: disabled (paranoid mode)"
+or "AssumeValid: pending — chain not yet at AV height". *Buys:*
+operators can audit at a glance which validation mode their fleet
+is using.
+
+### Operator-experience
+
+**8.13 ◐ Visible validation-profile audit trail.** Log line every
+N blocks during IBD: "Block H validated [full | conservative-skip
+| aggressive-skip | spot-check]". *Buys:* lets operators see when
+AV kicked in/out. Helps debug "is my node validating what I think
+it is?" *CoinCync angle:* must be privacy-aware — log block-level
+profile, NOT per-tx (per-tx would leak which txs got skipped).
+
+**8.14 ⭐ Per-network defaults.** Testnet defaults to **aggressive**
+(faster iteration, lower stakes); mainnet defaults to
+**conservative** (safer floor, slower but firmer). *Codifies
+different risk postures by network.*
+
+### Governance hooks
+
+**8.15 ⭐ AssumeValid ratchet (append-only).** Each release ADDS a
+new (height, hash) but never modifies or removes old ones. The
+constants table grows; never shrinks. *Buys:* audit trail in git
+history by construction. Catches the "someone tampered with the AV
+constant" case at code review time — the diff would *remove* a
+line, which is the suspicious case.
+
+**8.16 ◐ N-of-M maintainer signatures to update AV.** Adding a new
+AV constant requires N-of-M signatures from the `MAINTAINERS.md`
+set. *Buys:* closes the "single rogue maintainer poisons the
+chain" attack. Reuses the existing bus-factor framework.
+
+### Crucible-integration
+
+**8.17 ⭐ Crucible exercise: ship a binary with deliberately wrong
+AV hash.** Before locking a mainnet AV, run a Crucible cycle that
+distributes a binary with the WRONG hash to testers; verify the
+safety check (section 3 above) fires for all of them. *Buys:*
+empirical proof the abort path works before staking real users'
+chains on it. *CoinCync angle:* leverages the v1.0.13 Crucible
+automation (`1b6da66`) — bundle is one command.
+
+### My short-list (fold into v1.0.14 mechanism)
+
+⭐ 8.1, 8.4, 8.8, 8.10, 8.12, 8.14, 8.15, 8.17 — eight items.
+Together they form a coherent v1.0.14 AssumeValid that's:
+
+  - multi-source (8.1) so no single trust point
+  - sliding-window (8.4) so it doesn't go stale between releases
+  - privacy-safe (8.8) — key-image check never skipped
+  - snapshot-aware (8.10) — closes the loop with `e127a01`
+  - observable (8.12) — ibd-status shows the active mode
+  - per-network calibrated (8.14)
+  - append-only governed (8.15)
+  - empirically tested via Crucible (8.17) before lock
+
+The remaining ◐ items (8.2, 8.6, 8.11, 8.13, 8.16) are v1.0.15
+candidates — they extend the shape but aren't load-bearing for
+the v1.0.14 ship.
+
+The ○ items (8.3, 8.5, 8.7, 8.9) are either speculative or
+defense-in-depth additions that could go either way.
+
+<!-- OPERATOR: react to the short-list. Move items between tiers,
+add new ones, kill ideas you don't like. -->
 
 ---
 
@@ -238,6 +386,176 @@ bullet list, whichever's natural. -->
 
 Drop scratch / context / links here as the design evolves.
 
-- 2026-06-11: doc started. Sketched threat model + two-level activation
-  + hard safety check + constants shape + CLI surface + 3-commit plan.
-  All decision points still open.
+- **2026-06-11:** doc started. Sketched threat model + two-level
+  activation + hard safety check + constants shape + CLI surface +
+  3-commit plan. All decision points still open.
+- **2026-06-11:** added 17-idea bucket (section 8) + CoinCync-
+  uniqueness analysis (section 10). Short-list of 8 ⭐ items
+  proposed for v1.0.14 fold-in.
+
+---
+
+## 10. What makes this uniquely CoinCync (not a Bitcoin port)
+
+The temptation when designing a feature with a Bitcoin precedent is
+to port the Bitcoin design and call it done. For AssumeValid that
+would be: copy Bitcoin Core's flag, hardcode a hash, skip script
+verification below it. Done in 50 lines. **That's not what we're
+building**, and this section captures why — so that future
+reviewers can re-derive the choices we made rather than wondering
+why we didn't take the obvious path.
+
+### 10.1 The cost profile is different
+
+Bitcoin's expensive validation work is concentrated in *signature
+verification* (a single Secp256k1 curve multiplication per input).
+Roughly equal cost per input regardless of tx shape.
+
+CoinCync's expensive validation work is concentrated in
+**Bulletproofs+ range proofs** (~5–10 ms per output), distantly
+followed by CLSAG ring signature verification (~1 ms per input),
+with balance proofs as a rounding error.
+
+This matters because Bitcoin's `-assumevalid` is binary: skip all
+script verification, or skip none. The cost classes are too
+similar to bother with intermediate states. **CoinCync has
+meaningfully distinct cost classes**, which is why the
+conservative-vs-aggressive split (section 2) is even worth
+considering. We get to pick *which* expensive thing to skip;
+Bitcoin doesn't.
+
+### 10.2 The trust property being skipped is different
+
+Bitcoin's AssumeValid skips "does this signature prove ownership"
+— a fungibility / property-rights check. The threats it would
+otherwise catch are signature forgery and (with Segwit witness
+data) malleability shenanigans.
+
+CoinCync's AssumeValid would skip:
+
+- "Does this CLSAG prove ownership of the spend authority for one
+  of the ring members?" — same flavor as Bitcoin.
+- "Does this BP+ prove the output amount is in `[0, 2^64)`?" —
+  this has no Bitcoin equivalent because Bitcoin amounts are
+  cleartext integers.
+- "Does the balance proof show `Σ inputs = Σ outputs`?" — this also
+  has no Bitcoin equivalent.
+
+The last two are **inflation defenses**, not ownership defenses.
+Skipping them is qualitatively different from skipping sig checks.
+Our conservative default (sig-only) preserves the inflation floor;
+Bitcoin's aggressive-by-default doesn't have inflation-floor
+analog because the floor is a cheap integer check that's free to
+keep.
+
+This is why we land on **conservative-default + aggressive-opt-in**
+rather than Bitcoin's reverse: the inflation floor matters more in
+a confidential-amounts chain.
+
+### 10.3 Key-image uniqueness is the privacy-defining check
+
+Bitcoin's double-spend defense IS signature verification — same
+mechanism, two purposes. Skip sig verification and you've lost
+double-spend defense too.
+
+CoinCync's double-spend defense is **key-image set membership**
+(a database lookup), entirely separate from signature math. We can
+skip CLSAG verification entirely and still enforce no-double-spend
+at the database level. **Idea 8.8 is fundamentally a CoinCync
+concept**; there's no Bitcoin equivalent because the design space
+doesn't exist there.
+
+This decouples "ownership proof" from "double-spend prevention"
+in a way that gives us much safer defaults than Bitcoin would. We
+can be aggressive about skipping signature math without weakening
+the chain's double-spend defense — Bitcoin can't.
+
+### 10.4 Privacy-aware error handling
+
+When a Bitcoin node detects an AssumeValid mismatch, it logs the
+problem with peer addresses, block hashes, full context. That's
+fine for Bitcoin — there's no privacy expectation about which
+peer fed you which block.
+
+For CoinCync, the error path needs to **not leak which peer told
+us the bad data**. A nation-state running a poisoned peer could
+use error reports to detect "this IP just rejected my poisoned
+chain — they're a sophisticated user." We log the height and the
+hash mismatch, but not the peer identity, by default. Per-peer
+identification is gated behind an explicit `--log-peer-on-mismatch`
+flag for operators who are explicitly OK with that disclosure.
+
+### 10.5 Fleet-as-trust-anchor is a CoinCync pattern
+
+The `fleet.toml` ↔ `.well-known/` pattern we built in v1.0.13–14
+is unique to our deployment shape. Bitcoin has no fleet in this
+sense — it has a developer-author trust assumption plus a global
+DNS-seed network.
+
+For us, the project-operated fleet *is* the trust anchor. Idea 8.1
+(multi-source consensus checkpoint) leverages this directly: the
+fleet's own nodes publish their tip hashes to `.well-known/`, and
+a fresh node reaches k-of-n agreement across the fleet's
+publications. This is a load-bearing design choice — it means our
+trust model is "trust the fleet" rather than "trust one
+hardcoded constant", which scales more gracefully as the project
+grows.
+
+### 10.6 The Crucible program enables empirical verification
+
+Idea 8.17 (ship a binary with the wrong AV hash to Crucible
+testers, verify the abort fires) is impossible in the Bitcoin
+world because Bitcoin doesn't have a structured testing program
+of independent operators willing to run experimental binaries.
+
+We do. The v1.0.13 Crucible automation (`1b6da66`) makes the
+exercise mechanically cheap: one bundle command, distribution
+through Discord, results in a `docs/crucible/cycle-NN/` writeup.
+That's a CoinCync-specific testing capability that the design
+should explicitly take advantage of.
+
+### 10.7 Pre-mainnet timing lets us design AV in rather than retrofit
+
+Bitcoin Core added AssumeValid in 2017 — eight years after launch.
+By then the chain had a deep history and AV had to retrofit onto
+running consensus.
+
+CoinCync adds AssumeValid pre-mainnet. **We get to design AV into
+the launch state** rather than back-fitting. The hash gets baked
+in at GA based on testnet maturity; v1.0.0 of mainnet ships
+already AV-aware. This means we don't have the "old binaries
+without AV, new binaries with AV" version-skew problem Bitcoin
+navigated for years.
+
+### 10.8 Per-network calibration
+
+Bitcoin has mainnet, testnet, regtest, signet. Each has different
+trust profiles in practice but Bitcoin Core doesn't formalize
+that — `-assumevalid` is one flag, one default, regardless of
+network.
+
+For us, idea 8.14 (per-network defaults) codifies what's
+intuitively true: testnet operators want speed for iteration, so
+aggressive default; mainnet operators want safety floors, so
+conservative default. We make the network-dependent default
+explicit in code rather than leaving it for the operator to set
+correctly. This is small but worth doing.
+
+### Summary
+
+Five things make this design CoinCync-specific:
+
+1. **Distinct cost classes** (BP+ vs CLSAG vs balance) enable
+   meaningful conservative/aggressive split (§10.1)
+2. **Inflation-floor preservation** drives our default toward
+   conservative, opposite of Bitcoin's default (§10.2)
+3. **Key-image decoupled from signatures** lets us skip aggressively
+   without losing double-spend defense (§10.3, idea 8.8)
+4. **Fleet-as-trust-anchor** lets multi-source consensus checkpoints
+   reuse our existing infrastructure (§10.5, idea 8.1)
+5. **Crucible program** lets us empirically verify the safety check
+   before mainnet lock (§10.6, idea 8.17)
+
+If a future reviewer asks "why didn't you just port Bitcoin's
+design?" — the answer is "because those five points would have
+been wrong for our threat model and our deployment shape."
