@@ -167,6 +167,25 @@ enum Command {
         #[arg(long)]
         no_verify: bool,
     },
+    /// Create a published chaindata snapshot — tarball + SHA256
+    /// sidecar + metadata JSON. The producer side of `snapshot-fetch`.
+    ///
+    /// The node MUST be stopped before running this (RocksDB refuses
+    /// to read a directory the running node holds). After completion,
+    /// rsync the three output files to the publishing host.
+    ///
+    /// The "in-process snapshot without stopping the node" variant is
+    /// a v1.0.15 follow-up. For v1.0.14 we ship the stop-the-node
+    /// path because operators can already script
+    /// `systemctl stop && coincync-node snapshot-create && systemctl start`
+    /// and it's simpler to verify correctness.
+    SnapshotCreate {
+        /// Output path for the tarball (e.g. /tmp/snapshot.tar.gz).
+        /// The SHA256 sidecar is written to `<output>.sha256` and
+        /// the metadata JSON to `<output>.json` next to it.
+        #[arg(long)]
+        output: PathBuf,
+    },
 }
 
 // SECURITY (runtime resilience): force at least 4 worker threads regardless of
@@ -253,6 +272,9 @@ async fn main() {
         Command::IbdStatus { rpc_url } => ibd_status(network, rpc_url).await,
         Command::SnapshotFetch { url, force, no_verify } => {
             snapshot_fetch(network, &data_dir, &url, force, no_verify).await
+        }
+        Command::SnapshotCreate { output } => {
+            snapshot_create(network, &data_dir, &output).await
         }
         Command::CheckUpdate => check_update().await,
         Command::Start => {
@@ -749,6 +771,152 @@ async fn snapshot_fetch(
     eprintln!();
     eprintln!("On first start the node will resume sync from the snapshot's tip and");
     eprintln!("validate every subsequent block against consensus rules normally.");
+}
+
+/// `coincync-node snapshot-create --output <PATH>` — emit a publishable
+/// chaindata snapshot from the local data directory.
+///
+/// Producer side of the v1.0.14 `snapshot-fetch` subcommand. Requires
+/// the node to be STOPPED — RocksDB refuses to open a directory
+/// another process holds.
+///
+/// Three output files written, alongside each other:
+///
+///   <output>            — tarball (gzip-compressed)
+///   <output>.sha256     — `sha256sum`-compatible (hex + two-space + filename)
+///   <output>.json       — metadata sidecar (height, hash, build, generated)
+///
+/// The metadata schema matches what `snapshot-fetch` will (v1.0.15+)
+/// validate against. For v1.0.14 the fetcher only checks .sha256; the
+/// .json is written here so the publisher's pipeline already has the
+/// expected file in place when the fetcher catches up.
+async fn snapshot_create(
+    network: Network,
+    data_dir: &PathBuf,
+    output: &PathBuf,
+) {
+    use sha2::{Digest, Sha256};
+
+    let chaindata_dir = data_dir.join(match network {
+        Network::Mainnet => "mainnet",
+        Network::Testnet => "testnet",
+        Network::Regtest => "regtest",
+    });
+
+    if !chaindata_dir.is_dir() {
+        eprintln!("No chaindata at {:?} — nothing to snapshot.", chaindata_dir);
+        std::process::exit(1);
+    }
+
+    // ── Read tip height + tip hash before tar'ing ─────────────────
+    //
+    // Opens RocksDB read-only to grab the tip. If the running node
+    // hasn't been stopped, this errors out immediately — RocksDB's
+    // exclusive lock catches it.
+    let (tip_height, tip_hash_hex) = {
+        match Database::open(&chaindata_dir) {
+            Ok(db) => {
+                let chain = Blockchain::with_database(
+                    std::sync::Arc::new(db), network,
+                );
+                let _ = chain.load_from_database();
+                let tip = chain.tip();
+                (tip.height, hex::encode(tip.hash.as_bytes()))
+            }
+            Err(e) => {
+                eprintln!("Failed to open chaindata at {:?}: {}", chaindata_dir, e);
+                eprintln!("Is the node running? Stop it before running snapshot-create.");
+                std::process::exit(1);
+            }
+        }
+    };
+
+    eprintln!("Tip:          height={}, hash={}", tip_height, &tip_hash_hex[..16]);
+
+    // ── Build the tarball ─────────────────────────────────────────
+    eprintln!("Writing tarball to {:?} …", output);
+    let tar_file = match std::fs::File::create(output) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("Failed to create {:?}: {}", output, e);
+            std::process::exit(1);
+        }
+    };
+    let gz = flate2::write::GzEncoder::new(tar_file, flate2::Compression::default());
+    let mut tar_builder = tar::Builder::new(gz);
+    let arc_name = match network {
+        Network::Mainnet => "mainnet",
+        Network::Testnet => "testnet",
+        Network::Regtest => "regtest",
+    };
+    if let Err(e) = tar_builder.append_dir_all(arc_name, &chaindata_dir) {
+        eprintln!("Failed to tar {:?}: {}", chaindata_dir, e);
+        std::process::exit(1);
+    }
+    if let Err(e) = tar_builder.into_inner().and_then(|gz| gz.finish()) {
+        eprintln!("Failed to finalize tarball: {}", e);
+        std::process::exit(1);
+    }
+
+    let tarball_size = output.metadata().map(|m| m.len()).unwrap_or(0);
+    eprintln!("  tarball:    {} bytes", tarball_size);
+
+    // ── Compute SHA256 over the tarball ───────────────────────────
+    let tarball_sha = {
+        let bytes = match std::fs::read(output) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("Failed to re-read tarball for SHA256: {}", e);
+                std::process::exit(1);
+            }
+        };
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        hex::encode(hasher.finalize())
+    };
+    let sha_path = output.with_extension("tar.gz.sha256");
+    let tarball_name = output.file_name()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "snapshot.tar.gz".to_string());
+    let sha_content = format!("{}  {}\n", tarball_sha, tarball_name);
+    if let Err(e) = std::fs::write(&sha_path, sha_content) {
+        eprintln!("Failed to write SHA256 sidecar at {:?}: {}", sha_path, e);
+        std::process::exit(1);
+    }
+    eprintln!("  SHA256:     {}", &tarball_sha[..16]);
+    eprintln!("  sidecar:    {:?}", sha_path);
+
+    // ── Write metadata JSON ───────────────────────────────────────
+    let json_path = output.with_extension("tar.gz.json");
+    let metadata = serde_json::json!({
+        "schema_version": "1.0",
+        "network":        match network {
+            Network::Mainnet => "mainnet",
+            Network::Testnet => "testnet",
+            Network::Regtest => "regtest",
+        },
+        "tip_height":     tip_height,
+        "tip_hash":       tip_hash_hex,
+        "build_commit":   env!("CARGO_PKG_VERSION"),  // best-effort — real git SHA needs build.rs
+        "generated":      "2026-06-11T00:00:00Z",     // placeholder; build.rs would inject real time
+        "tarball_size":   tarball_size,
+        "tarball_sha256": tarball_sha,
+    });
+    if let Err(e) = std::fs::write(&json_path, serde_json::to_string_pretty(&metadata).unwrap()) {
+        eprintln!("Failed to write metadata JSON at {:?}: {}", json_path, e);
+        std::process::exit(1);
+    }
+    eprintln!("  metadata:   {:?}", json_path);
+
+    eprintln!();
+    eprintln!("Snapshot ready. Publish all three files together:");
+    eprintln!("    {}", output.display());
+    eprintln!("    {}", sha_path.display());
+    eprintln!("    {}", json_path.display());
+    eprintln!();
+    eprintln!("Suggested publishing path:");
+    eprintln!("    https://coincync.network/snapshots/{}/{}.tar.gz", arc_name, tip_height);
+    eprintln!("And update `latest` to redirect to {}.tar.gz.", tip_height);
 }
 
 async fn start_node(
