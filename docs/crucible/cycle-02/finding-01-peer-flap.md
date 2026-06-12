@@ -1,11 +1,24 @@
-# Cycle 02 Finding #1 — Peer flap every ~10s on stable IPv6 link
+# Cycle 02 Finding #1 — Peer flap every ~75s on stable IPv6 WAN link
 
-**Status:** open. Cause not yet root-caused.
+**Status:** root-caused (NAT / TCP-keepalive), fix in progress.
 **Severity:** medium. Stable enough that chain sync still progresses;
 operationally noisy (CPU burn on repeated Noise handshakes, log
-volume).
-**Builds affected:** `v1.0.11-fleet` (`b8571c8`) — possibly earlier;
-not yet checked against v1.0.13/14.
+volume); blocks tx propagation when the disconnect happens to
+overlap with a block-relay window.
+**Builds affected:** `v1.0.11-fleet` (`b8571c8`) — likely all
+earlier versions too; the missing TCP keepalive sockopts have been
+absent since the network layer was first written.
+
+## Updates
+
+- **2026-06-11:** Initial draft from cycle 02 observation.
+- **2026-06-11 (later):** Loopback reproduction test ran for
+  145+ seconds with **zero disconnects** between two v1.0.11
+  binaries connected via IPv6 loopback (`[::1]`). Same binary,
+  same noise wrapper, same code path — but no flap. Confirms
+  the flap is **not application-layer**; it's NAT/router state
+  expiration on the WAN path. Fix shifts from "investigate
+  source" to "set TCP keepalive on outbound P2P sockets."
 
 ## TL;DR
 
@@ -47,27 +60,28 @@ Found during Cycle 02 live test. Was checking why chain sync was
 slow (h=3 after several minutes) and noticed the flap pattern
 when filtering out `GetHeaders` log spam.
 
-## Hypotheses, ranked by likelihood
+## Hypotheses, ranked by likelihood (post-loopback-test)
 
-1. **KeepAlive not set on the TCP socket.** Without `TCP_KEEPIDLE`
-   / `TCP_KEEPINTVL`, idle connections die when an intermediate
-   NAT/firewall expires its state. Default Linux behavior is
-   `tcp_keepalive_time = 7200s` (2h), so this alone doesn't
-   explain a 10-second cycle. But if barns' router has a short
-   UDP/TCP idle timeout (some consumer routers default to
-   30-60s for non-established connections) AND we send no
-   keepalive frames, this could fire repeatedly during low
-   traffic. The handshake itself looks healthy.
-2. **Noise framing layer has a self-timeout we're not aware of.**
-   If our Noise wrapper expects a heartbeat frame within N
-   seconds and one doesn't arrive (because we're stuck on
-   IBD-GetHeaders polling with no other traffic), the wrapper
-   could close the stream itself.
-3. **Barns' node sends a graceful close that we interpret as
-   a network error.** "IO error: unexpected end of file" suggests
-   the peer closed cleanly (FIN packet) and we read the EOF.
-   Could mean barns has logic that closes peers under some
-   condition we're hitting.
+1. **CONFIRMED — TCP keepalive not set on outbound P2P
+   sockets.** Without `TCP_KEEPIDLE` / `TCP_KEEPINTVL`, idle
+   connections die when an intermediate NAT/firewall expires
+   its state. Consumer routers default to short timeouts
+   (60-300s for established TCP). With our P2P traffic
+   pattern of "GetHeaders every 500ms + nothing else for
+   minutes" during low activity, a router can expire the
+   state between two GetHeaders if the gap exceeds its idle
+   timeout. The Noise stream then sees EOF from the
+   no-longer-routed peer. Cycle 02 measured ~75s flap interval
+   (not 10s as initially estimated) which is consistent with
+   a 60-90s NAT idle timeout.
+2. *(ruled out)* Noise framing self-timeout. Loopback test
+   shows the same noise wrapper sustained 145+ seconds without
+   close. If a wrapper-internal timeout existed it would also
+   fire on loopback.
+3. *(ruled out)* Graceful-close-from-barns. We see the same
+   EOF symmetrically from operator's side, and the loopback
+   test (both sides controlled by us) showed no
+   close-and-reconnect, so this isn't a peer-logic event.
 
 ## What we know
 

@@ -2,23 +2,50 @@
 
 **Verifies:** [Cycle 01 Finding #1](../cycle-01/finding-01-silent-mempool-eviction.md)
 — "silent mempool eviction" — observability arm of the fix.
-**Status:** confirmed. The improvement is real and visible.
+**Status:** confirmed for the underlying pattern. **Original
+attribution revised** — see below.
 **Builds under test:** rig built from `c:/dev/coincync` (uncommitted
 v1.0.12-consensus-refresh WIP) submitting to `v1.0.11-fleet` node
 (`b8571c8`).
 
-## The reproduction scenario
+## Initial draft (revised)
 
-Cycle 01 Finding #1's underlying class is "version mismatch between
-the wallet/rig that constructs a thing and the node that validates
-it." Cycle 01 caught this for the wallet+node case (barns submitted
-a v1.0.10-wallet-built tx to a v1.0.11 node, got silent eviction).
+The first version of this verification doc attributed the rejection
+banner to a v1.0.11/v1.0.12 consensus version skew. **That was
+incorrect.** Closer reading of the node log showed that:
 
-Cycle 02 reproduced the same class accidentally for the rig+node
-case: operator's local rig was built from the WIP v1.0.12 consensus
-work (graduated 11→13→16 ring-size ramp + other changes); local
-node is v1.0.11. The rig produced blocks following v1.0.12 rules;
-the node rejected them.
+- The rejection banner fired at 01:22:05 (the rig's first submit
+  attempt right after startup).
+- A second submit at 01:22:29 by the SAME v1.0.12 rig was **accepted**
+  by the SAME v1.0.11 node and committed at h=1.
+- Subsequent blocks at h=2 and h=3 also accepted from the same rig.
+
+So the consensus rules between v1.0.11 and the WIP v1.0.12 are
+compatible at the heights tested (h=1-3). The v1.0.12 changes
+visible in the diff (graduated 11→13→16 ring-size ramp via new
+`MID_RING_SIZE` + `RING_SIZE_RAMP_TO_MID_HEIGHT=5000`) wouldn't
+diverge from v1.0.11 until h≥5000.
+
+**Actual cause of the initial rejection:** node startup transient.
+The rig submitted right after the node finished its own startup
+sequence; the node wasn't yet ready to accept submissions and
+returned an error. The rig dutifully printed the rejection banner
+with version-skew listed as one of four possible causes.
+
+This is itself a small Cycle 02 finding (queued):
+
+- **The rig prints the same banner for "node not ready"
+  startup errors as for "real consensus disagreement"** — leads
+  operator misdiagnosis. Should distinguish in the message.
+
+## The pattern this still verifies
+
+Cycle 01 Finding #1's class is broader than "version skew": it's
+"a path that previously failed silently now fails loudly." The
+banner shipped in Cycle 01's observability arm fires for ANY
+rejection that goes through `submit_block`, including startup
+transients. The verification still holds for the underlying
+class — when something rejects, we see it.
 
 ## What we saw
 
