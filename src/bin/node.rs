@@ -979,11 +979,20 @@ async fn start_node(
 
     if no_peers {
         info!("--no-peers: automatic peer discovery disabled (manual --addnode peers still allowed)");
-        // Enforce true isolation: disable bootstrap seeds and outbound slots.
-        // Without this, the node can still dial built-in seeds.
+        // Enforce true isolation: disable bootstrap seeds, but keep
+        // outbound slots == manual peer count so --addnode dialing
+        // still works. The previous `= 0` line silently killed every
+        // --addnode peer when --no-peers was set — Cycle 01 Finding #2.
+        // See docs/crucible/cycle-01/finding-02-no-peers-kills-addnode.md.
+        //
+        // This fix is also on v1.0.11-fleet branch (commit d8b23fe); it
+        // wasn't inherited by v1.0.14 because v1.0.11-fleet hasn't merged
+        // to main yet — re-applying here so the v1.0.14 binary doesn't
+        // ship with the regression. Root cleanup: merge v1.0.11-fleet
+        // through main so the fix and its regression test propagate.
         p2p_config.bootstrap.dns_seeds.clear();
         p2p_config.bootstrap.seed_nodes.clear();
-        p2p_config.max_outbound = 0;
+        p2p_config.max_outbound = extra_peers.len().max(1);
     }
 
     // --proxy / --tor / --onion-only wire-up.
