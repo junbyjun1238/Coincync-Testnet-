@@ -40,7 +40,7 @@ validator below.
 
 Published snapshots live under the apex host:
 
-```
+```text
 https://coincync.network/snapshots/<network>/<height>.tar.gz
 https://coincync.network/snapshots/<network>/<height>.tar.gz.sha256
 https://coincync.network/snapshots/<network>/<height>.json   # metadata
@@ -61,19 +61,38 @@ coincync-node snapshot-fetch https://coincync.network/snapshots/testnet/latest
   "schema_version": "1.0",
   "network":        "testnet",
   "tip_height":     14328,
-  "tip_hash":       "0x…",
+  "tip_hash":       "<hex>",
+  "build_version":  "1.0.10",
   "build_commit":   "<git sha>",
+  "build_dirty":    false,
+  "build_profile":  "release",
   "generated":      "2026-06-11T20:14:33Z",
   "tarball_size":   194812374,
   "tarball_sha256": "abc123…"
 }
 ```
 
+Field-by-field:
+
+| Field | Source | What it tells you |
+| --- | --- | --- |
+| `schema_version` | constant | Major.minor; consumer rejects on major mismatch. |
+| `network` | CLI | Must match the requesting node's network. |
+| `tip_height` | local chaindata | The height the snapshot resumes from. |
+| `tip_hash` | local chaindata | Lets a consumer cross-check against a known-honest peer's tip. |
+| `build_version` | `CARGO_PKG_VERSION` at compile time | Crate version that built the snapshot creator. |
+| `build_commit` | `COINCYNC_BUILD_GIT_SHA` from `build.rs` | Git SHA of the creator binary; lets you check it matches your fetcher. |
+| `build_dirty` | `COINCYNC_BUILD_GIT_DIRTY` from `build.rs` | `true` if the creator binary was built from a dirty tree — should refuse for production snapshots. |
+| `build_profile` | `COINCYNC_BUILD_PROFILE` from `build.rs` | `debug` / `release` — release-only for production. |
+| `generated` | runtime (`chrono::Utc::now()`) | When the snapshot was created, NOT when the binary was compiled. RFC 3339. |
+| `tarball_size` | OS stat | Bytes; lets the consumer estimate download time. |
+| `tarball_sha256` | computed | Hex; same value as in the `.sha256` sidecar. |
+
 Required for production-published snapshots. The fetcher in v1.0.14
 doesn't yet parse this file (it only checks the `.sha256` sidecar
 for integrity); CI follow-up adds a metadata-parse step that asserts
-network + schema_version match the requesting node's expectation.
-Tracked as a v1.0.15 item.
+network + schema_version + build_dirty=false match the requesting
+node's expectation. Tracked as a v1.0.15 item.
 
 ## Creating a snapshot (operator side)
 

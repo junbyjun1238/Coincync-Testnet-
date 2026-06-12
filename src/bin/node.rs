@@ -897,8 +897,20 @@ async fn snapshot_create(
         },
         "tip_height":     tip_height,
         "tip_hash":       tip_hash_hex,
-        "build_commit":   env!("CARGO_PKG_VERSION"),  // best-effort — real git SHA needs build.rs
-        "generated":      "2026-06-11T00:00:00Z",     // placeholder; build.rs would inject real time
+        // Both injected by build.rs at compile time. The dirty flag
+        // matters: a snapshot built from a dirty tree is fine for
+        // local testing but should never be published as a release
+        // snapshot (the SHA doesn't correspond to a reachable commit).
+        // Consumers can refuse to fetch snapshots whose build_dirty=true.
+        "build_version":  env!("CARGO_PKG_VERSION"),
+        "build_commit":   env!("COINCYNC_BUILD_GIT_SHA"),
+        "build_dirty":    env!("COINCYNC_BUILD_GIT_DIRTY") == "true",
+        "build_profile":  env!("COINCYNC_BUILD_PROFILE"),
+        // Generated = when this snapshot was created, NOT when the
+        // binary was compiled. Use runtime time.
+        "generated":      chrono::Utc::now().to_rfc3339_opts(
+            chrono::SecondsFormat::Secs, true,
+        ),
         "tarball_size":   tarball_size,
         "tarball_sha256": tarball_sha,
     });
