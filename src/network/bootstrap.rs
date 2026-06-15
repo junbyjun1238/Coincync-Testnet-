@@ -459,47 +459,39 @@ impl AddressManager {
 
     /// Load address book from disk
     pub fn load_from_file(&mut self, path: &std::path::Path) -> Result<usize> {
-        if !path.exists() {
-            return Ok(0);
-        }
-
-        // v1.0.12 audit-follow-up: bound the read at MAX_ADDRBOOK_BYTES
-        // before fs::read_to_string allocates, AND cap the parsed Vec
-        // length post-decode. Same OOM-on-startup risk class as
-        // Mempool::load_from_disk (commit 95e93066): any actor with
-        // filesystem access can drop a multi-GB or N-billion-entry
-        // JSON file into the data dir.
+        // v1.0.13 refactor: bounded-load pattern shared with
+        // mempool.rs via helpers::read_bounded_file_bytes +
+        // helpers::validate_vec_len. Same protection as v1.0.11.1
+        // hand-rolled version — see helpers.rs for security
+        // rationale.
         //
-        // Honest address books with max_addresses=100 entries serialize
-        // to a few KB. 1 MB is ~10K entries — generous over the
-        // in-memory cap, narrow enough to make a crafted-file DoS
-        // impractical. Hard-coded vs a public const because no other
-        // call site needs to reason about this number.
+        // Honest address books with max_addresses=100 entries
+        // serialize to a few KB. 1 MiB file cap is ~10K entries,
+        // generous headroom over the in-memory cap; entry cap
+        // 10_000 is the post-decode defense.
         const MAX_ADDRBOOK_BYTES: u64 = 1024 * 1024; // 1 MiB
         const MAX_ADDRBOOK_ENTRIES: usize = 10_000;
 
-        let metadata = std::fs::metadata(path)
-            .map_err(|e| Error::InvalidState(format!("stat address book: {}", e)))?;
-        if metadata.len() > MAX_ADDRBOOK_BYTES {
-            // Remove the oversized file so the node isn't bricked.
-            let _ = std::fs::remove_file(path);
-            return Err(Error::InvalidState(format!(
-                "address book file too large: {} bytes (max {})",
-                metadata.len(), MAX_ADDRBOOK_BYTES
-            )));
-        }
+        let bytes = match crate::helpers::read_bounded_file_bytes(
+            path,
+            MAX_ADDRBOOK_BYTES,
+            "address book",
+        ).map_err(|e| Error::InvalidState(e.to_string()))? {
+            Some(b) => b,
+            None => return Ok(0),
+        };
 
-        let data = std::fs::read_to_string(path)
-            .map_err(|e| Error::InvalidState(format!("read address book: {}", e)))?;
-        let entries: Vec<PeerAddressSerde> = serde_json::from_str(&data)
+        // serde_json wants a &str — UTF-8 validate the bytes once.
+        let data = std::str::from_utf8(&bytes)
+            .map_err(|e| Error::InvalidState(format!("address book not UTF-8: {}", e)))?;
+        let entries: Vec<PeerAddressSerde> = serde_json::from_str(data)
             .map_err(|e| Error::InvalidState(format!("parse address book: {}", e)))?;
 
-        if entries.len() > MAX_ADDRBOOK_ENTRIES {
-            return Err(Error::InvalidState(format!(
-                "address book file has {} entries (max {})",
-                entries.len(), MAX_ADDRBOOK_ENTRIES
-            )));
-        }
+        let entries = crate::helpers::validate_vec_len(
+            entries,
+            MAX_ADDRBOOK_ENTRIES,
+            "address book",
+        ).map_err(|e| Error::InvalidState(e.to_string()))?;
 
         let mut loaded = 0;
         for entry in entries {
