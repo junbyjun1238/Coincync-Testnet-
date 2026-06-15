@@ -1007,6 +1007,173 @@ fn target_to_u128(bytes: &[u8; 32]) -> u128 {
 }
 
 
+/// **Context-free transaction invariants.** Checks that don't need
+/// chain height or the UTXO set — pure structural validation on the
+/// `Transaction` bytes alone.
+///
+/// ## v1.0.13 refactor (#11) — kills the sister-function-drift class
+///
+/// Before this extraction, both `validate_transaction` (block-side)
+/// and `validate_transaction_basic` (mempool-side) re-implemented the
+/// same structural checks independently. Three v1.0.12 fixes were of
+/// the shape "check existed in basic but not in full" or vice versa:
+///
+/// 1. version=0 reject — only in basic, miner could include it in a
+///    block (2026-06-03 fix)
+/// 2. encrypted_amount + encrypted_memo size caps — only in basic,
+///    miner could direct-mine bloated outputs (v1.0.12 commit
+///    161fd74f)
+/// 3. dup-stealth-address reject — added to full, never made it to
+///    basic (v1.0.12 commit 5aeb27dd)
+///
+/// Centralizing the context-free layer here means every future check
+/// inherits the property "runs on both paths" automatically.
+///
+/// ## What lives here
+///
+/// - Version range: `0 < tx.version <= MAX_TX_VERSION`
+/// - Inputs/outputs non-empty + count caps
+/// - Per-output: `encrypted_amount.len() <= 64`,
+///   `encrypted_memo.len() <= 256`, stealth address validity
+///   (non-zero + on-curve), commitment validity (non-zero + on-curve)
+/// - Per-input (non-coinbase): key image validity (non-zero + on-curve)
+/// - In-tx dup key images
+/// - Tx size <= MAX_TX_SIZE
+///
+/// ## What does NOT live here
+///
+/// - V2 activation gate (needs `current_height`)
+/// - UTXO membership (needs `UtxoSet`)
+/// - Coinbase maturity (needs both)
+/// - Ring-size floor (needs `current_height` for the graduated ramp;
+///   `_basic` enforces a conservative `BOOTSTRAP_MIN_RING_SIZE` floor
+///   separately)
+/// - Fee floor (mempool policy, not consensus)
+/// - Range-proof presence (mempool policy — block validator runs
+///   range-proof crypto verify instead)
+/// - Cross-tx checks (dup stealth across txs in same block — block-level)
+pub fn check_context_free_invariants(tx: &Transaction) -> Result<()> {
+    // Version range — closes the 2026-06-03 "version=0 in basic only" gap
+    if tx.version == 0 || tx.version > MAX_TX_VERSION {
+        return Err(Error::InvalidTxVersion(tx.version));
+    }
+
+    // Inputs/outputs non-empty + count caps. Coinbase is exempt from
+    // the non-empty inputs check (handled by caller's coinbase early
+    // return).
+    if !tx.is_coinbase() && tx.inputs.is_empty() {
+        return Err(Error::InvalidInputCount { count: 0, max: crate::constants::MAX_TX_INPUTS });
+    }
+    if tx.outputs.is_empty() {
+        return Err(Error::InvalidOutputCount { count: 0, max: crate::constants::MAX_TX_OUTPUTS });
+    }
+    if tx.inputs.len() > crate::constants::MAX_TX_INPUTS {
+        return Err(Error::InvalidInputCount {
+            count: tx.inputs.len(),
+            max: crate::constants::MAX_TX_INPUTS,
+        });
+    }
+    if tx.outputs.len() > crate::constants::MAX_TX_OUTPUTS {
+        return Err(Error::InvalidOutputCount {
+            count: tx.outputs.len(),
+            max: crate::constants::MAX_TX_OUTPUTS,
+        });
+    }
+
+    // Tx size cap. Min-size is mempool-policy (rejects too-small txs
+    // as likely-spam); MAX is consensus.
+    let size = tx.size();
+    if size > crate::constants::MAX_TX_SIZE {
+        return Err(Error::TransactionTooLarge {
+            size,
+            max: crate::constants::MAX_TX_SIZE,
+        });
+    }
+
+    // Per-output structural checks. Closes the v1.0.12 "encrypted_amount
+    // + encrypted_memo caps in basic only" gap.
+    for (out_idx, output) in tx.outputs.iter().enumerate() {
+        if output.encrypted_amount.is_empty() {
+            return Err(Error::OutputTooSmall {
+                amount: 0,
+                min: crate::constants::MIN_OUTPUT_AMOUNT,
+            });
+        }
+        if output.encrypted_amount.len() > 64 {
+            return Err(Error::InvalidTransaction(format!(
+                "output {} encrypted_amount too large: {} bytes (max 64)",
+                out_idx, output.encrypted_amount.len(),
+            )));
+        }
+        if output.encrypted_memo.len() > 256 {
+            return Err(Error::InvalidTransaction(format!(
+                "output {} encrypted_memo too large: {} bytes (max 256)",
+                out_idx, output.encrypted_memo.len(),
+            )));
+        }
+
+        // Stealth address: non-zero + on-curve Ristretto point.
+        // H-19 + 2018 Monero burning bug class.
+        if output.stealth_address.as_bytes() == &[0u8; 32] {
+            return Err(Error::InvalidTransaction(format!(
+                "output {} stealth address is zero (unspendable — potential burning attack)",
+                out_idx,
+            )));
+        }
+        if crate::crypto::PublicPoint::from_bytes(*output.stealth_address.as_bytes()).is_none() {
+            return Err(Error::InvalidTransaction(format!(
+                "output {} stealth address is not a valid Ristretto point (unspendable)",
+                out_idx,
+            )));
+        }
+
+        // Commitment: non-zero + on-curve. Zero commitment = identity
+        // point = balance-equation-breakable.
+        if output.commitment == [0u8; 32] {
+            return Err(Error::InvalidTransaction(format!(
+                "output {} commitment is zero (identity point — balance equation breakable)",
+                out_idx,
+            )));
+        }
+        if crate::crypto::PublicPoint::from_bytes(output.commitment).is_none() {
+            return Err(Error::InvalidTransaction(format!(
+                "output {} commitment is not a valid Ristretto point",
+                out_idx,
+            )));
+        }
+    }
+
+    // Per-input key image validity (C-9 / H-18 / 2017 Monero key-image bug class).
+    // Coinbase has no inputs.
+    if !tx.is_coinbase() {
+        let mut seen_key_images = std::collections::HashSet::with_capacity(tx.inputs.len());
+        for (idx, input) in tx.inputs.iter().enumerate() {
+            let ki_bytes = input.key_image.as_bytes();
+            if ki_bytes == &[0u8; 32] {
+                return Err(Error::InvalidTransaction(format!(
+                    "input {} has zero key image (double-spend detection bypass)",
+                    idx,
+                )));
+            }
+            if crate::crypto::PublicPoint::from_bytes(*ki_bytes).is_none() {
+                return Err(Error::InvalidTransaction(format!(
+                    "input {} key image is not a valid curve point",
+                    idx,
+                )));
+            }
+            // In-tx dup key image — generic error to avoid leaking
+            // the duplicated key image to a submitter.
+            if !seen_key_images.insert(input.key_image) {
+                return Err(Error::DuplicateKeyImage(
+                    "duplicate key image within transaction".into(),
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Validate a transaction
 #[tracing::instrument(
     skip(tx, utxos),
@@ -1021,37 +1188,19 @@ pub fn validate_transaction(
     utxos: &UtxoSet,
     current_height: u64,
 ) -> Result<()> {
-    // ── Version range enforcement ──────────────────────────────────────
-    // Reject tx.version == 0 and tx.version > MAX_TX_VERSION.
-    //
-    // 2026-06-03 bug found during critical-file review: previously this
-    // function only checked the V2 *activation* gate (below). The upper
-    // bound and the version==0 reject lived ONLY in
-    // `validate_transaction_basic`, which runs on mempool admission — not
-    // on block validation. A miner could therefore include a tx with
-    // version=0 or version=255 directly in a mined block; block
-    // validation calls `validate_transaction` (see validate_block at
-    // line ~698), which would let any future / unknown version through
-    // as long as the crypto held.
-    //
-    // Why this matters for future hard forks: a v1.0 node receiving a
-    // version=3 tx in a v1.1 block must NOT accept it (the on-wire shape
-    // could differ across versions, and silent acceptance would split
-    // consensus at the fork). With this gate, a future hard fork that
-    // introduces version=3 must explicitly bump MAX_TX_VERSION in the
-    // upgraded code — a flag-day rejection on stale nodes is the correct
-    // behaviour. Coinbase included: a coinbase with version=99 was
-    // previously waved through by the `is_coinbase()` early-return.
-    if tx.version == 0 || tx.version > MAX_TX_VERSION {
-        return Err(Error::InvalidTxVersion(tx.version));
-    }
+    // v1.0.13 refactor (#11): all context-free structural checks
+    // (version range, input/output counts + caps, per-output field
+    // bounds, key image validity, in-tx dup key images, tx size)
+    // are now in check_context_free_invariants. Shared with
+    // validate_transaction_basic so neither path can drift.
+    check_context_free_invariants(tx)?;
 
-    // Coinbase has no inputs to validate
+    // Coinbase has no inputs to validate further at this layer.
     if tx.is_coinbase() {
         return Ok(());
     }
 
-    // ── Version enforcement ─────────────────────────────────────────────
+    // ── Version enforcement (CONTEXT-DEPENDENT — needs current_height) ──
     // V2 transactions are only valid at/above the activation height.
     // V1 transactions remain valid at all heights (backward compat).
     // Rejecting V2 below activation prevents pre-fork asset tx injection.
@@ -1060,31 +1209,6 @@ pub fn validate_transaction(
             "V2 transactions not allowed below activation height {} (current: {})",
             crate::constants::V2_TX_ACTIVATION_HEIGHT, current_height
         )));
-    }
-    // Must have inputs
-    if tx.inputs.is_empty() {
-        return Err(Error::InvalidInputCount { count: 0, max: crate::constants::MAX_TX_INPUTS });
-    }
-
-    // Must have outputs
-    if tx.outputs.is_empty() {
-        return Err(Error::InvalidOutputCount { count: 0, max: crate::constants::MAX_TX_OUTPUTS });
-    }
-
-    // Check input count
-    if tx.inputs.len() > crate::constants::MAX_TX_INPUTS {
-        return Err(Error::InvalidInputCount {
-            count: tx.inputs.len(),
-            max: crate::constants::MAX_TX_INPUTS,
-        });
-    }
-
-    // Check output count
-    if tx.outputs.len() > crate::constants::MAX_TX_OUTPUTS {
-        return Err(Error::InvalidOutputCount {
-            count: tx.outputs.len(),
-            max: crate::constants::MAX_TX_OUTPUTS,
-        });
     }
 
     // SECURITY: Reject extreme input/output ratios that could indicate
@@ -1825,37 +1949,19 @@ const MAX_TX_VERSION: u8 = 2;
 
 /// Quick contextless validation (for mempool)
 pub fn validate_transaction_basic(tx: &Transaction) -> Result<()> {
-    // FIX #39: accept any version in 1..=MAX_TX_VERSION.
-    // Previously this was a hard `tx.version != 1` reject which made V2
-    // transactions impossible to submit via mempool even after
-    // V2_TX_ACTIVATION_HEIGHT, completely breaking the V2 feature for
-    // external users. The activation-height gate lives in the full
-    // `validate_transaction()` (see the `tx.version >= 2 && current_height
-    // < V2_TX_ACTIVATION_HEIGHT` check at line ~811), so pre-activation
-    // V2 txs are still rejected — just not by this contextless path.
-    if tx.version == 0 || tx.version > MAX_TX_VERSION {
-        return Err(Error::InvalidTxVersion(tx.version));
-    }
+    // v1.0.13 refactor (#11): context-free structural checks now in
+    // check_context_free_invariants. Same source of truth as the
+    // block-side validate_transaction — neither can drift.
+    check_context_free_invariants(tx)?;
 
-    // SECURITY (BUG-17): Reject transactions with empty inputs or outputs.
-    // This prevents mempool pollution with malformed transactions that can
-    // never be mined (full validate_transaction checks this, but basic didn't).
-    if tx.inputs.is_empty() {
-        return Err(Error::InvalidTransaction("transaction has no inputs".into()));
-    }
-    if tx.outputs.is_empty() {
-        return Err(Error::InvalidTransaction("transaction has no outputs".into()));
-    }
+    // ── Mempool-policy checks (not consensus) ──────────────────────
+    // These reject txs that ARE structurally valid but mempool refuses
+    // to relay them. Block validation does NOT enforce these (miners
+    // can include sub-MIN_TX_SIZE / zero-fee / sub-ring-floor txs in
+    // mined blocks; consensus accepts them. Mempool is policy.)
 
-    // Check size
+    // Min tx size (mempool spam floor).
     let size = tx.size();
-    if size > crate::constants::MAX_TX_SIZE {
-        return Err(Error::TransactionTooLarge {
-            size,
-            max: crate::constants::MAX_TX_SIZE,
-        });
-    }
-
     if size < crate::constants::MIN_TX_SIZE {
         return Err(Error::TransactionTooSmall {
             size,
@@ -1863,7 +1969,7 @@ pub fn validate_transaction_basic(tx: &Transaction) -> Result<()> {
         });
     }
 
-    // Check minimum fee
+    // Minimum fee.
     let min_fee = (size as u64) * crate::constants::MIN_FEE_PER_BYTE;
     if tx.fee.as_atomic() < min_fee && !tx.is_coinbase() {
         return Err(Error::FeeTooLow {
@@ -1873,11 +1979,12 @@ pub fn validate_transaction_basic(tx: &Transaction) -> Result<()> {
     }
 
     // ═══ CONSTITUTIONAL ENFORCEMENT ═══
-    // Constitution Article III / Bill of Rights I: Mandatory Privacy
-    // Every transaction MUST have ring signatures (inputs with ring members)
-    // and range proofs (Bulletproofs). No transparent transactions allowed.
+    // Constitution Article III / Bill of Rights I: Mandatory Privacy.
+    // Mempool-side conservative floor — uses BOOTSTRAP_MIN_RING_SIZE
+    // rather than the height-keyed ring_size_at_height(). Block validation
+    // uses the height-correct value, but here we don't have a height,
+    // so reject anything below the bootstrap floor.
     if !tx.is_coinbase() {
-        // Ring size must meet minimum (Constitution Article III)
         for input in &tx.inputs {
             if input.ring_members.len() < crate::constants::BOOTSTRAP_MIN_RING_SIZE {
                 return Err(Error::InvalidTransaction(format!(
@@ -1886,7 +1993,9 @@ pub fn validate_transaction_basic(tx: &Transaction) -> Result<()> {
                 )));
             }
         }
-        // Range proof must exist (Bill of Rights I — Bulletproofs required)
+        // Range proof must exist (Bill of Rights I — Bulletproofs required).
+        // Block-side runs the actual range-proof crypto verify (heavier);
+        // here we just check presence.
         if tx.range_proof.is_empty() {
             return Err(Error::InvalidTransaction(
                 "UNCONSTITUTIONAL: missing range proof (Bill of Rights I — Bulletproofs required)".into()
@@ -1894,111 +2003,10 @@ pub fn validate_transaction_basic(tx: &Transaction) -> Result<()> {
         }
     }
 
-    // Constitution Article IX / Bill of Rights X: No censorship
+    // Constitution Article IX / Bill of Rights X: No censorship.
     // This validation function processes ALL valid transactions equally.
     // There is no blacklist check, no address filter, no censorship hook.
     // The absence of such code IS the enforcement.
-
-    // SECURITY: Reject transactions with duplicate key images within a single tx.
-    // Without this, attackers can relay double-spend txs that pass mempool admission
-    // but can never be mined, wasting mempool space and network bandwidth.
-    {
-        let mut seen_key_images = std::collections::HashSet::new();
-        for input in &tx.inputs {
-            if !seen_key_images.insert(input.key_image) {
-                return Err(Error::InvalidTransaction(
-                    "duplicate key image within transaction".into()
-                ));
-            }
-        }
-    }
-
-    // Check input/output count bounds
-    if tx.inputs.len() > crate::constants::MAX_TX_INPUTS {
-        return Err(Error::InvalidInputCount {
-            count: tx.inputs.len(),
-            max: crate::constants::MAX_TX_INPUTS,
-        });
-    }
-    if tx.outputs.len() > crate::constants::MAX_TX_OUTPUTS {
-        return Err(Error::InvalidOutputCount {
-            count: tx.outputs.len(),
-            max: crate::constants::MAX_TX_OUTPUTS,
-        });
-    }
-
-    // Check output amounts and field size limits
-    // SECURITY (DESER-R7): Reject outputs with oversized Vec<u8> fields to prevent
-    // memory exhaustion from malicious blocks/transactions during deserialization.
-    for output in &tx.outputs {
-        // Output must have valid structure
-        if output.encrypted_amount.is_empty() {
-            return Err(Error::OutputTooSmall {
-                amount: 0,
-                min: crate::constants::MIN_OUTPUT_AMOUNT,
-            });
-        }
-        // encrypted_amount: exactly 8 bytes (XOR'd u64)
-        if output.encrypted_amount.len() > 64 {
-            return Err(Error::InvalidTransaction(
-                format!("encrypted_amount too large: {} bytes (max 64)", output.encrypted_amount.len()),
-            ));
-        }
-        // encrypted_memo: optional, max 256 bytes to prevent blockchain bloat
-        if output.encrypted_memo.len() > 256 {
-            return Err(Error::InvalidTransaction(
-                format!("encrypted_memo too large: {} bytes (max 256)", output.encrypted_memo.len()),
-            ));
-        }
-
-        // SECURITY (H-19): Reject outputs with invalid curve points as stealth address.
-        // An invalid Ristretto point (e.g., all-0xFF, random non-curve bytes) creates
-        // an unspendable output — enabling burning attacks where an attacker destroys
-        // another user's funds by sending to addresses nobody can spend from.
-        // Historical precedent: Monero burning bug (September 2018).
-        if output.stealth_address.as_bytes() == &[0u8; 32] {
-            return Err(Error::InvalidTransaction(
-                "output stealth address is zero (unspendable — potential burning attack)".into()
-            ));
-        }
-        if crate::crypto::PublicPoint::from_bytes(*output.stealth_address.as_bytes()).is_none() {
-            return Err(Error::InvalidTransaction(
-                "output stealth address is not a valid Ristretto point (unspendable)".into()
-            ));
-        }
-
-        // SECURITY (H-19): Reject zero or invalid commitments.
-        // A zero commitment (identity point) breaks the balance equation.
-        if output.commitment == [0u8; 32] {
-            return Err(Error::InvalidTransaction(
-                "output commitment is zero (identity point — balance equation breakable)".into()
-            ));
-        }
-        if crate::crypto::PublicPoint::from_bytes(output.commitment).is_none() {
-            return Err(Error::InvalidTransaction(
-                "output commitment is not a valid Ristretto point".into()
-            ));
-        }
-    }
-
-    // SECURITY (C-9 / H-18): Reject inputs with invalid key images.
-    // A zero key image or non-curve-point key image bypasses double-spend detection.
-    // Historical precedent: Monero key image validation bug (April 2017).
-    if !tx.is_coinbase() {
-        for (idx, input) in tx.inputs.iter().enumerate() {
-            let ki_bytes = input.key_image.as_bytes();
-            if ki_bytes == &[0u8; 32] {
-                return Err(Error::InvalidTransaction(format!(
-                    "input {} has zero key image (double-spend detection bypass)", idx
-                )));
-            }
-            if crate::crypto::PublicPoint::from_bytes(*ki_bytes).is_none() {
-                return Err(Error::InvalidTransaction(format!(
-                    "input {} key image is not a valid curve point", idx
-                )));
-            }
-        }
-    }
 
     Ok(())
 }
