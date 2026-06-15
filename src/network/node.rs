@@ -136,6 +136,24 @@ pub enum NodeEvent {
     Error(String),
 }
 
+/// v1.0.13 #1 — result of checking an inbound Version nonce against
+/// the outbound-nonce tracker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OutboundNonceMatch {
+    /// Nonce isn't one of ours — normal peer Version, no special handling.
+    NotOurs,
+    /// Nonce matches AND the inbound peer addr matches the addr we
+    /// originally dialed. Genuine self-connection (loopback config
+    /// error) — safe to call `mark_self_address`.
+    SelfConnect,
+    /// Nonce matches but the inbound peer addr differs from where we
+    /// sent it. Someone observed our nonce and is replaying it from a
+    /// different IP. **Do NOT call `mark_self_address`** — that's
+    /// exactly the eclipse-attack vector the v1.0.12 patch closed
+    /// defensively. Just disconnect.
+    ReplayAttack,
+}
+
 /// P2P node configuration
 #[derive(Clone, Debug)]
 pub struct NodeConfig {
@@ -238,8 +256,37 @@ pub struct P2PNode {
     /// Wired into `notify_block_orphan`; flooders are scored with
     /// `MisbehaviorType::OrphanFlood`.
     orphan_flood: Arc<RwLock<super::scoring::OrphanFloodTracker>>,
-    /// SECURITY (NET-001): Version nonce for self-connection detection
+    /// SECURITY (NET-001): Version nonce for self-connection detection.
+    ///
+    /// Retained for compatibility — every outbound dial now ALSO gets a
+    /// fresh per-dial nonce registered in `pending_outbound_nonces` (v1.0.13
+    /// #1 — per-outbound nonce tracking). `version_nonce` is still used by
+    /// the inbound-Version comparison fallback for older peers that don't
+    /// echo per-dial nonces back; the per-dial map takes precedence when
+    /// the nonce matches an entry there.
     version_nonce: u64,
+    /// v1.0.13 #1 — per-outbound nonce tracking.
+    ///
+    /// Maps `nonce → (dialed-addr, registered-at)` for outbound dials.
+    /// Every outbound connection generates a fresh random nonce, registers
+    /// it here keyed by the destination address, then sends Version with
+    /// that nonce.
+    ///
+    /// On inbound Version with `nonce.matches(some-entry)`:
+    /// - If the inbound peer's addr == the registered addr → genuine
+    ///   self-connection (we dialed ourselves; loopback config error).
+    ///   It's now safe to call `mark_self_address` because the address
+    ///   match proves the nonce came back from where we sent it.
+    /// - If the addrs differ → REPLAY ATTACK. Some attacker observed our
+    ///   nonce on a previous connection and is replaying it from a
+    ///   different IP to trick us into banning that IP. Just disconnect,
+    ///   do NOT mark_self_address — that's the eclipse-attack vector the
+    ///   v1.0.12 patch (commit 63997ddf) closed defensively. This per-
+    ///   outbound design closes it correctly.
+    ///
+    /// Entries TTL out after 60s via `prune_expired_outbound_nonces()`,
+    /// called from the maintenance loop tick.
+    pending_outbound_nonces: Arc<parking_lot::RwLock<std::collections::HashMap<u64, (std::net::SocketAddr, std::time::Instant)>>>,
     /// Channel for sync-safe transaction broadcast queueing (used by RPC handlers)
     /// SECURITY: Bounded to prevent OOM from malicious RPC flood
     tx_broadcast_tx: tokio::sync::mpsc::Sender<Transaction>,
@@ -306,6 +353,7 @@ impl P2PNode {
             peer_scorer: Arc::new(RwLock::new(PeerScorer::new())),
             orphan_flood: Arc::new(RwLock::new(super::scoring::OrphanFloodTracker::new())),
             version_nonce: rand::random::<u64>(),
+            pending_outbound_nonces: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
             tx_broadcast_tx,
             tx_broadcast_rx: parking_lot::Mutex::new(Some(tx_broadcast_rx)),
             dht: None,
@@ -317,6 +365,50 @@ impl P2PNode {
     /// Call this after construction for Tier 2+ nodes.
     pub fn set_dht(&mut self, dht: Arc<parking_lot::Mutex<super::dht::DhtState>>) {
         self.dht = Some(dht);
+    }
+
+    // ─── v1.0.13 #1 — per-outbound nonce tracker helpers ───
+
+    /// Register a freshly-generated nonce for an outbound dial.
+    ///
+    /// Call this BEFORE writing the Version frame. The nonce will be
+    /// matched against any inbound Version that echoes it back; if the
+    /// inbound peer's address matches the registered address, it's a
+    /// genuine self-connection and `mark_self_address` is safe.
+    pub fn register_outbound_nonce(
+        tracker: &Arc<parking_lot::RwLock<std::collections::HashMap<u64, (std::net::SocketAddr, std::time::Instant)>>>,
+        nonce: u64,
+        addr: std::net::SocketAddr,
+    ) {
+        tracker.write().insert(nonce, (addr, std::time::Instant::now()));
+    }
+
+    /// Result of looking up an inbound Version nonce against the
+    /// outbound-nonce tracker.
+    pub fn check_outbound_nonce(
+        tracker: &Arc<parking_lot::RwLock<std::collections::HashMap<u64, (std::net::SocketAddr, std::time::Instant)>>>,
+        nonce: u64,
+        peer_addr: std::net::SocketAddr,
+    ) -> OutboundNonceMatch {
+        let guard = tracker.read();
+        match guard.get(&nonce) {
+            None => OutboundNonceMatch::NotOurs,
+            Some((expected_addr, _ts)) if *expected_addr == peer_addr => OutboundNonceMatch::SelfConnect,
+            Some(_) => OutboundNonceMatch::ReplayAttack,
+        }
+    }
+
+    /// Prune outbound-nonce entries older than 60s.
+    /// Called from the maintenance loop tick.
+    pub fn prune_expired_outbound_nonces(
+        tracker: &Arc<parking_lot::RwLock<std::collections::HashMap<u64, (std::net::SocketAddr, std::time::Instant)>>>,
+    ) -> usize {
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_secs(60);
+        let mut guard = tracker.write();
+        let before = guard.len();
+        guard.retain(|_, (_, ts)| now.duration_since(*ts) < ttl);
+        before.saturating_sub(guard.len())
     }
 
     /// Query key image spend status via DHT stripe routing.
@@ -837,6 +929,11 @@ impl P2PNode {
         let acceptor_scorer = self.peer_scorer.clone();
         let acceptor_identity = identity.clone();
         let acceptor_encryption = encryption_config.clone();
+        // v1.0.13 #1 — per-outbound nonce tracker, also passed to
+        // inbound accepts (where it's used READ-ONLY for the
+        // version-receive lookup; inbound never registers new
+        // nonces — only outbound dials do).
+        let acceptor_pending_outbound_nonces = self.pending_outbound_nonces.clone();
 
         tokio::spawn(async move {
             // Consume accepted connections from the dedicated p2p-accept
@@ -942,12 +1039,14 @@ impl P2PNode {
                         let conn_identity = acceptor_identity.clone();
                         let conn_encryption = acceptor_encryption.clone();
 
+                        let conn_pending_outbound_nonces = acceptor_pending_outbound_nonces.clone();
                         tokio::spawn(async move {
                             let result = handle_connection(
                                 stream, peer_id, false, magic, our_nonce, height, tip,
                                 peers, senders, event_tx, msg_tx,
                                 conn_identity, conn_encryption,
                                 None, // inbound — no per-/16 slot to track
+                                conn_pending_outbound_nonces,
                             ).await;
 
                             // Untrack connection when done
@@ -973,6 +1072,9 @@ impl P2PNode {
         let connector_proxy = self.config.proxy.clone();
         let connector_scorer = self.peer_scorer.clone();
         let connector_identity = identity.clone();
+        // v1.0.13 #1 — every outbound dial registers a fresh per-dial
+        // nonce keyed by destination addr here BEFORE sending Version.
+        let connector_pending_outbound_nonces = self.pending_outbound_nonces.clone();
         let connector_encryption = encryption_config.clone();
         let connector_listen_port = self.config.listen_addr.port();
         let connector_tracker = self.conn_tracker.clone();
@@ -1215,6 +1317,7 @@ impl P2PNode {
                     let backoffs = backoffs.clone();
                     let conn_identity = connector_identity.clone();
                     let conn_encryption = connector_encryption.clone();
+                    let conn_pending_outbound_nonces = connector_pending_outbound_nonces.clone();
 
                     tokio::spawn(async move {
                         // Use proxy if configured, otherwise direct connection
@@ -1235,6 +1338,7 @@ impl P2PNode {
                                     peers, senders, event_tx, msg_tx,
                                     conn_identity, conn_encryption,
                                     Some(outbound_slot.clone()),
+                                    conn_pending_outbound_nonces,
                                 ).await {
                                     warn!("Outbound connection error: {}", e);
                                     addresses.write().await.mark_tried(addr);
@@ -1280,6 +1384,8 @@ impl P2PNode {
         let processor_addresses = addresses.clone();
         let processor_scorer = self.peer_scorer.clone();
         let processor_identity = self.identity.clone();
+        // v1.0.13 #1
+        let processor_pending_outbound_nonces = self.pending_outbound_nonces.clone();
 
         tokio::spawn(async move {
             // Phase D (audit fix): per-peer message rate tracking.
@@ -1330,6 +1436,7 @@ impl P2PNode {
                             processor_addresses.clone(),
                             processor_scorer.clone(),
                             processor_identity.clone(),
+                            processor_pending_outbound_nonces.clone(),
                         ).await {
                             warn!("Message processing error: {}", e);
                         }
@@ -1891,6 +1998,9 @@ impl P2PNode {
         // tick can build a fresh locator from the current local height
         // each cycle (see header-refresh arm in the maintenance select!).
         let maint_chain = self.chain.clone();
+        // v1.0.13 #1 — passed to the maintenance loop for opportunistic
+        // 60s-TTL pruning, folded into the existing ping tick.
+        let maint_pending_outbound_nonces = self.pending_outbound_nonces.clone();
         // Take the broadcast queue receiver for the maintenance task
         let mut broadcast_rx = self.tx_broadcast_rx.lock()
             .take()
@@ -1939,6 +2049,14 @@ impl P2PNode {
                             for sender in maint_senders.iter() {
                                 let _ = sender.send(data.clone()).await;
                             }
+                        }
+                        // v1.0.13 #1 — opportunistic GC of expired
+                        // outbound-nonce entries (60s TTL). Folded into
+                        // the existing ping cadence (~25s) since the
+                        // tick is cheap and the map is small.
+                        let pruned = P2PNode::prune_expired_outbound_nonces(&maint_pending_outbound_nonces);
+                        if pruned > 0 {
+                            tracing::trace!("pruned {} expired outbound-nonce entries", pruned);
                         }
                     }
 
@@ -2597,6 +2715,13 @@ async fn handle_connection(
     // the skip-cleanup branch (where peers.remove is intentionally
     // not called to preserve a concurrent reconnection).
     eclipse_slot: Option<Arc<super::connection_tracker::OutboundSubnetSlot>>,
+    // v1.0.13 #1 — per-outbound nonce tracker. Outbound dials
+    // register a fresh nonce keyed by destination addr here BEFORE
+    // sending Version; inbound Version-receive looks up the incoming
+    // nonce against this map (in version-receive handler). Inbound
+    // accepts don't write to the map — they just send the legacy
+    // per-node version_nonce for back-compat with older peers.
+    pending_outbound_nonces: Arc<parking_lot::RwLock<std::collections::HashMap<u64, (std::net::SocketAddr, std::time::Instant)>>>,
 ) -> Result<()> {
     let addr = stream.peer_addr()
         .map_err(|e| Error::ConnectionFailed(e.to_string()))?;
@@ -2741,8 +2866,27 @@ async fn handle_connection(
 
     // Per-peer rate limiter to prevent abuse
 
-    // SECURITY (NET-001): Send version message with our nonce for self-connection detection
-    let version_msg = Message::version_with_nonce(magic, our_height, our_tip, our_nonce)?;
+    // SECURITY (NET-001 + v1.0.13 #1): Send Version with self-conn nonce.
+    //
+    // For OUTBOUND dials: generate a fresh random nonce and register
+    // it in pending_outbound_nonces keyed by the peer's address. If
+    // the dial loops back to ourselves (self-addnode config), the
+    // inbound side's Version-receive handler will look up this nonce
+    // and confirm the addr matches — only then is mark_self_address
+    // safe to call (closes the eclipse-attack vector defended against
+    // by the v1.0.12 commit 63997ddf).
+    //
+    // For INBOUND accepts: use the legacy per-node version_nonce. We
+    // didn't dial anyone, so we have no addr to key a per-dial nonce
+    // by. Back-compat with peers running pre-v1.0.13 code.
+    let outgoing_nonce = if outbound {
+        let fresh = rand::random::<u64>();
+        P2PNode::register_outbound_nonce(&pending_outbound_nonces, fresh, addr);
+        fresh
+    } else {
+        our_nonce
+    };
+    let version_msg = Message::version_with_nonce(magic, our_height, our_tip, outgoing_nonce)?;
     let version_bytes = version_msg.to_bytes()?;
     // The framer handles header creation, but version_msg already includes header
     // Write the complete message directly for initial handshake
@@ -3097,6 +3241,12 @@ async fn process_message(
     addresses: Arc<RwLock<AddressManager>>,
     scorer: Arc<RwLock<PeerScorer>>,
     _identity: Arc<super::noise::NodeIdentity>,
+    // v1.0.13 #1 — per-outbound nonce tracker, consulted by the
+    // Version-receive handler to distinguish genuine self-conn
+    // (loopback config error → safe to mark_self_address) from
+    // a replay attack (nonce observed elsewhere, replayed from a
+    // different IP → MUST NOT call mark_self_address).
+    pending_outbound_nonces: Arc<parking_lot::RwLock<std::collections::HashMap<u64, (std::net::SocketAddr, std::time::Instant)>>>,
 ) -> Result<()> {
     // Data format is now [msg_type, ...payload] after framer processing
     if data.is_empty() {
@@ -3178,44 +3328,70 @@ async fn process_message(
                 }
             };
             {
-                // SECURITY (NET-001 + v1.0.12 fix): Detect self-connection
-                // via nonce match — but DON'T permanently ban the peer's
-                // address.
+                // SECURITY (NET-001 + v1.0.13 #1): Self-connection detection
+                // via per-outbound nonce tracker.
                 //
-                // The pre-v1.0.12 code marked any address that sent us
-                // OUR nonce as "ours" and permanently skipped it. But
-                // `our_nonce` is a per-node-lifetime u64; any peer who
-                // received our Version (i.e., every peer we've dialed
-                // or been dialed by) knows it and can replay it. An
-                // attacker spins up a peer, reads our_nonce from our
-                // outbound Version, then connects FROM A DIFFERENT
-                // ADDRESS sending our_nonce back. Pre-fix: we
-                // permanently banned that address. With repeats, the
-                // attacker could blacklist ANY IP — eclipse attack
-                // surface.
-                //
-                // The right defense is per-outbound nonce tracking
-                // (track which nonce we sent to which addr; require
-                // the inbound nonce to match BOTH the value AND the
-                // sender address). That's a v1.0.13 follow-up because
-                // it touches the Version-send path and the connection
-                // state map. For v1.0.12 we ship the smaller
-                // defensive fix: detect the nonce match, disconnect,
-                // but DON'T mark the address as ours. A legitimate
-                // self-connection (typically a config error where the
-                // operator addnoded their own IP) becomes a one-time
-                // disconnect the operator can resolve via config; an
-                // attacker can no longer poison the address book.
-                if version.nonce == our_nonce {
-                    warn!(
-                        "Self-connection nonce match from peer {:?} \
-                         — disconnecting. Note: NOT marking as self-address \
-                         because the nonce is replay-able; if this fires \
-                         repeatedly for legitimately-yours addresses, \
-                         verify the operator config doesn't list its own IP \
-                         in --addnode.",
-                        &peer_id[..4],
-                    );
+                // History:
+                // - Pre-v1.0.12: any nonce match called mark_self_address —
+                //   eclipse vector because nonces are replay-able.
+                // - v1.0.12 commit 63997ddf: nonce match → disconnect, but
+                //   no ban. Closed the eclipse vector defensively but cost
+                //   us the legitimate "operator self-addnoded their IP"
+                //   guard.
+                // - v1.0.13 #1 (THIS): per-outbound tracker. Every outbound
+                //   dial registers (fresh_nonce, dialed_addr). On inbound
+                //   Version: look up nonce. If found + addr matches →
+                //   genuine self-conn, safe to mark_self_address (closes
+                //   the loopback config issue properly). If found + addr
+                //   differs → replay attack, disconnect without ban. If
+                //   not in tracker → fall through to legacy per-node
+                //   nonce compare for back-compat with older peers.
+                let peer_addr = peers.get(&peer_id).map(|p| p.addr);
+                let match_result = peer_addr.map(|addr| {
+                    P2PNode::check_outbound_nonce(&pending_outbound_nonces, version.nonce, addr)
+                }).unwrap_or(OutboundNonceMatch::NotOurs);
+
+                let self_conn_detected = match match_result {
+                    OutboundNonceMatch::SelfConnect => {
+                        warn!(
+                            "Self-connection confirmed (per-outbound nonce + addr match) \
+                             for peer {:?} at {:?}. Marking address as self.",
+                            &peer_id[..4], peer_addr,
+                        );
+                        if let Some(self_addr) = peer_addr {
+                            addresses.write().await.mark_self_address(self_addr);
+                            info!("Permanently skipping self-address {}", self_addr);
+                        }
+                        true
+                    }
+                    OutboundNonceMatch::ReplayAttack => {
+                        warn!(
+                            "Outbound nonce replay from peer {:?} at {:?} (nonce was sent \
+                             to a DIFFERENT addr). Disconnecting, NOT marking as self — \
+                             this is the eclipse-attack pattern v1.0.12 closed defensively.",
+                            &peer_id[..4], peer_addr,
+                        );
+                        true
+                    }
+                    OutboundNonceMatch::NotOurs => {
+                        // Fall through to legacy per-node nonce compare.
+                        // Pre-v1.0.13 peers that connect back to us still
+                        // get caught here.
+                        if version.nonce == our_nonce {
+                            warn!(
+                                "Self-connection legacy-nonce match from peer {:?} — \
+                                 disconnecting. Did NOT mark_self_address (legacy nonce \
+                                 is replay-able; only per-outbound matches are trusted).",
+                                &peer_id[..4],
+                            );
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                };
+
+                if self_conn_detected {
                     peers.remove(&peer_id);
                     senders.remove(&peer_id);
                     let _ = event_tx.send(NodeEvent::PeerDisconnected(peer_id));
