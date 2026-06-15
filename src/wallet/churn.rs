@@ -120,7 +120,14 @@ pub struct ChurnEngine {
     /// Wallet file path.
     wallet_path: std::path::PathBuf,
     /// Wallet password (held in memory while churn is active).
-    wallet_password: String,
+    ///
+    /// v1.0.13 #5 — Zeroizing wrapper so the long-lived password held
+    /// for the engine's lifetime is wiped from the heap on drop.
+    /// ChurnEngine instances live the duration of the auto-churn
+    /// session (hours/days); keeping the password in a plain String
+    /// for that long was the largest in-process exposure window we
+    /// had outside of WalletData itself.
+    wallet_password: zeroize::Zeroizing<String>,
     /// Shutdown signal.
     shutdown: Arc<AtomicBool>,
     /// Runtime stats.
@@ -132,7 +139,7 @@ impl ChurnEngine {
     pub fn new(
         config: ChurnConfig,
         wallet_path: std::path::PathBuf,
-        wallet_password: String,
+        wallet_password: zeroize::Zeroizing<String>,
         shutdown: Arc<AtomicBool>,
     ) -> Result<Self, String> {
         config.validate()?;
@@ -485,7 +492,7 @@ mod tests {
                 ..Default::default()
             },
             std::path::PathBuf::from("/tmp/test.wallet"),
-            "test".to_string(),
+            zeroize::Zeroizing::new("test".to_string()),
             shutdown,
         )
         .unwrap();
@@ -515,7 +522,7 @@ mod tests {
         let engine = ChurnEngine::new(
             ChurnConfig::default(),
             std::path::PathBuf::from("/tmp/test.wallet"),
-            "test".to_string(),
+            zeroize::Zeroizing::new("test".to_string()),
             shutdown,
         )
         .unwrap();
@@ -532,7 +539,7 @@ mod tests {
                 ..Default::default()
             },
             std::path::PathBuf::from("/tmp/test.wallet"),
-            "test".to_string(),
+            zeroize::Zeroizing::new("test".to_string()),
             shutdown,
         )
         .unwrap();

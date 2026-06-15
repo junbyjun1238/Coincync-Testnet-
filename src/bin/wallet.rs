@@ -563,7 +563,7 @@ const MAX_PASSWORD_LEN: usize = 4 * 1024;
 /// refactor tracked as a v1.0.13 follow-up. For v1.0.12, the
 /// critical fixes are (a) echo-off (this commit) and (b) the
 /// argv-exposure warning + stdin bound below.
-fn prompt_password(confirm: bool) -> Result<String, String> {
+fn prompt_password(confirm: bool) -> Result<zeroize::Zeroizing<String>, String> {
     let prompt = dialoguer::Password::new()
         .with_prompt("Password");
     let prompt = if confirm {
@@ -571,7 +571,10 @@ fn prompt_password(confirm: bool) -> Result<String, String> {
     } else {
         prompt
     };
-    let pw = prompt.interact().map_err(|e| e.to_string())?;
+    // dialoguer returns a plain String; immediately wrap so the
+    // backing heap allocation is wiped on the Zeroizing<String> drop
+    // even if we error out mid-validation. v1.0.13 #5.
+    let pw = zeroize::Zeroizing::new(prompt.interact().map_err(|e| e.to_string())?);
     if pw.is_empty() {
         return Err("password must not be empty".into());
     }
@@ -605,16 +608,19 @@ fn prompt_password(confirm: bool) -> Result<String, String> {
 /// `confirm` only applies to the interactive path — piping is assumed
 /// to be deliberate, and re-typing for confirmation is hostile to
 /// automation.
-fn resolve_password(opt: Option<String>, confirm: bool) -> Result<String, String> {
+fn resolve_password(opt: Option<String>, confirm: bool) -> Result<zeroize::Zeroizing<String>, String> {
     use std::io::Read;
+    use zeroize::Zeroize;
     match opt {
         Some(s) if s == "-" => {
             // v1.0.12 fix: bound stdin read at MAX_PASSWORD_LEN so a
             // multi-GB piped file doesn't OOM the binary.
             let stdin = std::io::stdin();
             let mut handle = stdin.lock().take((MAX_PASSWORD_LEN + 1) as u64);
-            let mut buf = String::new();
-            handle.read_to_string(&mut buf).map_err(|e| e.to_string())?;
+            // v1.0.13 #5: stdin buffer is Zeroizing so the intermediate
+            // copy is wiped on drop, including the error paths below.
+            let mut buf = zeroize::Zeroizing::new(String::new());
+            handle.read_to_string(&mut *buf).map_err(|e| e.to_string())?;
             if buf.len() > MAX_PASSWORD_LEN {
                 return Err(format!(
                     "stdin password too long (max {} bytes); refusing to read \
@@ -625,16 +631,16 @@ fn resolve_password(opt: Option<String>, confirm: bool) -> Result<String, String
             // Strip ONE trailing newline (typical interactive paste
             // pattern). Don't trim() — leading/trailing whitespace
             // might be intentional in the password.
-            let pw_str: String = buf
+            let pw_str = zeroize::Zeroizing::new(buf
                 .trim_end_matches('\n')
                 .trim_end_matches('\r')
-                .to_string();
+                .to_string());
             if pw_str.is_empty() {
                 return Err("password must not be empty when reading from stdin".into());
             }
             Ok(pw_str)
         }
-        Some(s) => {
+        Some(mut s) => {
             // ARGV exposure warning — see function doc.
             tracing::warn!(
                 "Password passed via `--password <literal>` is visible to \
@@ -642,7 +648,14 @@ fn resolve_password(opt: Option<String>, confirm: bool) -> Result<String, String
                  `wmic process get commandline` on Windows. Prefer `--password -` \
                  (piping the secret on stdin) for non-interactive use."
             );
-            Ok(s)
+            // v1.0.13 #5: copy the bytes into a Zeroizing wrapper and
+            // explicitly zeroize the original clap-owned String so the
+            // heap allocation that held the password through clap's
+            // parse + dispatch is wiped immediately, instead of
+            // leaking until the caller's drop.
+            let pw = zeroize::Zeroizing::new(s.clone());
+            s.zeroize();
+            Ok(pw)
         }
         None => prompt_password(confirm),
     }
@@ -703,7 +716,10 @@ async fn cmd_create(
         let _ = std::fs::create_dir_all(parent);
     }
 
-    save_wallet(path, &data, password.as_deref())
+    // v1.0.13 #5: password is now Option<Zeroizing<String>>.
+    // as_deref doesn't give us &str directly (intermediate &String);
+    // chain through as_str to land on &str for the library API.
+    save_wallet(path, &data, password.as_ref().map(|p| p.as_str()))
         .map_err(|e| format!("save failed: {}", e))?;
 
     println!("Wallet created at {:?}", path);
