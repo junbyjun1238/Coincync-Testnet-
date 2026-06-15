@@ -136,6 +136,76 @@ pub enum NodeEvent {
     Error(String),
 }
 
+/// v1.0.13 #2 — bounded TTL cache of tx hashes that peers have told
+/// us (via `NotFound`) they don't have. The InvTx-receive handler
+/// consults this to skip GetTxs for hashes recently NotFound'd —
+/// closes the "peer flood-asks for the same tx we don't have, we
+/// re-query mempool on every InvTx" amp surface.
+///
+/// - TTL: 60 seconds (entries expire; same tx may legitimately
+///   reappear via a different peer's mempool)
+/// - Max size: 10_000 entries (hard cap — under attack, oldest
+///   entries get evicted on insert)
+///
+/// Implemented as `HashMap<Hash, Instant>` (no need for full LRU
+/// — eviction is opportunistic on insert + during the maintenance
+/// tick, which is enough for the use case).
+pub struct TxAbsenceCache {
+    inner: std::collections::HashMap<crate::primitives::Hash, std::time::Instant>,
+    ttl: std::time::Duration,
+    max_size: usize,
+}
+
+impl TxAbsenceCache {
+    pub fn new() -> Self {
+        Self {
+            inner: std::collections::HashMap::new(),
+            ttl: std::time::Duration::from_secs(60),
+            max_size: 10_000,
+        }
+    }
+
+    /// Mark a hash as known-absent from at least one peer.
+    pub fn mark_absent(&mut self, hash: crate::primitives::Hash) {
+        // Opportunistic eviction if we're at the cap. Drop entries
+        // older than TTL first; if still at cap, drop oldest.
+        if self.inner.len() >= self.max_size {
+            self.prune();
+            if self.inner.len() >= self.max_size {
+                // Hard-cap eviction: oldest entry first. Linear scan is
+                // fine at 10K entries; this only fires under attack.
+                if let Some((oldest, _)) = self.inner.iter().min_by_key(|(_, ts)| *ts).map(|(h, t)| (*h, *t)) {
+                    self.inner.remove(&oldest);
+                }
+            }
+        }
+        self.inner.insert(hash, std::time::Instant::now());
+    }
+
+    /// True if the hash is in the cache AND its entry hasn't expired.
+    pub fn is_known_absent(&self, hash: &crate::primitives::Hash) -> bool {
+        match self.inner.get(hash) {
+            Some(ts) => ts.elapsed() < self.ttl,
+            None => false,
+        }
+    }
+
+    /// Drop expired entries. Called from the maintenance loop tick.
+    pub fn prune(&mut self) -> usize {
+        let ttl = self.ttl;
+        let before = self.inner.len();
+        self.inner.retain(|_, ts| ts.elapsed() < ttl);
+        before.saturating_sub(self.inner.len())
+    }
+
+    pub fn len(&self) -> usize { self.inner.len() }
+    pub fn is_empty(&self) -> bool { self.inner.is_empty() }
+}
+
+impl Default for TxAbsenceCache {
+    fn default() -> Self { Self::new() }
+}
+
 /// v1.0.13 #1 — result of checking an inbound Version nonce against
 /// the outbound-nonce tracker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -287,6 +357,10 @@ pub struct P2PNode {
     /// Entries TTL out after 60s via `prune_expired_outbound_nonces()`,
     /// called from the maintenance loop tick.
     pending_outbound_nonces: Arc<parking_lot::RwLock<std::collections::HashMap<u64, (std::net::SocketAddr, std::time::Instant)>>>,
+    /// v1.0.13 #2 — tx-absence cache. Consulted by the InvTx-receive
+    /// path to skip GetTxs for hashes recently reported NotFound.
+    /// Populated by the NotFound-receive handler.
+    tx_absence_cache: Arc<parking_lot::RwLock<TxAbsenceCache>>,
     /// Channel for sync-safe transaction broadcast queueing (used by RPC handlers)
     /// SECURITY: Bounded to prevent OOM from malicious RPC flood
     tx_broadcast_tx: tokio::sync::mpsc::Sender<Transaction>,
@@ -354,6 +428,7 @@ impl P2PNode {
             orphan_flood: Arc::new(RwLock::new(super::scoring::OrphanFloodTracker::new())),
             version_nonce: rand::random::<u64>(),
             pending_outbound_nonces: Arc::new(parking_lot::RwLock::new(std::collections::HashMap::new())),
+            tx_absence_cache: Arc::new(parking_lot::RwLock::new(TxAbsenceCache::new())),
             tx_broadcast_tx,
             tx_broadcast_rx: parking_lot::Mutex::new(Some(tx_broadcast_rx)),
             dht: None,
@@ -1386,6 +1461,8 @@ impl P2PNode {
         let processor_identity = self.identity.clone();
         // v1.0.13 #1
         let processor_pending_outbound_nonces = self.pending_outbound_nonces.clone();
+        // v1.0.13 #2
+        let processor_tx_absence_cache = self.tx_absence_cache.clone();
 
         tokio::spawn(async move {
             // Phase D (audit fix): per-peer message rate tracking.
@@ -1437,6 +1514,7 @@ impl P2PNode {
                             processor_scorer.clone(),
                             processor_identity.clone(),
                             processor_pending_outbound_nonces.clone(),
+                            processor_tx_absence_cache.clone(),
                         ).await {
                             warn!("Message processing error: {}", e);
                         }
@@ -2001,6 +2079,9 @@ impl P2PNode {
         // v1.0.13 #1 — passed to the maintenance loop for opportunistic
         // 60s-TTL pruning, folded into the existing ping tick.
         let maint_pending_outbound_nonces = self.pending_outbound_nonces.clone();
+        // v1.0.13 #2 — same opportunistic-prune pattern for the
+        // tx-absence cache.
+        let maint_tx_absence_cache = self.tx_absence_cache.clone();
         // Take the broadcast queue receiver for the maintenance task
         let mut broadcast_rx = self.tx_broadcast_rx.lock()
             .take()
@@ -2057,6 +2138,11 @@ impl P2PNode {
                         let pruned = P2PNode::prune_expired_outbound_nonces(&maint_pending_outbound_nonces);
                         if pruned > 0 {
                             tracing::trace!("pruned {} expired outbound-nonce entries", pruned);
+                        }
+                        // v1.0.13 #2 — same TTL GC for the tx-absence cache.
+                        let pruned_abs = maint_tx_absence_cache.write().prune();
+                        if pruned_abs > 0 {
+                            tracing::trace!("pruned {} expired tx-absence entries", pruned_abs);
                         }
                     }
 
@@ -3247,6 +3333,9 @@ async fn process_message(
     // a replay attack (nonce observed elsewhere, replayed from a
     // different IP → MUST NOT call mark_self_address).
     pending_outbound_nonces: Arc<parking_lot::RwLock<std::collections::HashMap<u64, (std::net::SocketAddr, std::time::Instant)>>>,
+    // v1.0.13 #2 — tx-absence cache, populated by NotFound-receive,
+    // consulted by InvTx-receive.
+    tx_absence_cache: Arc<parking_lot::RwLock<TxAbsenceCache>>,
 ) -> Result<()> {
     // Data format is now [msg_type, ...payload] after framer processing
     if data.is_empty() {
@@ -3656,9 +3745,16 @@ async fn process_message(
                     return Ok(());
                 }
                 let mut needed = Vec::new();
-                for inv in &inv_msg.inventory {
-                    if !mempool.contains(&inv.hash) {
-                        needed.push(inv.hash);
+                {
+                    // v1.0.13 #2 — single read-lock to filter both
+                    // mempool presence AND tx-absence cache (so we
+                    // don't re-request hashes a peer recently said
+                    // they don't have).
+                    let absence = tx_absence_cache.read();
+                    for inv in &inv_msg.inventory {
+                        if !mempool.contains(&inv.hash) && !absence.is_known_absent(&inv.hash) {
+                            needed.push(inv.hash);
+                        }
                     }
                 }
                 // Request missing transactions via GetTxs
@@ -3672,6 +3768,40 @@ async fn process_message(
                         }
                     }
                 }
+            }
+        }
+
+        MessageType::NotFound => {
+            // v1.0.13 #2 — peer told us they don't have a set of
+            // hashes we asked for. Mark each in the absence cache
+            // so the InvTx handler skips re-requesting them via
+            // GetTxs for the TTL window (60s).
+            if payload.len() > super::protocol::MAX_MESSAGE_SIZE {
+                warn!("NotFound message too large from peer {:?}", &peer_id[..4]);
+                if let Some(addr) = peers.get(&peer_id).map(|p| p.addr) {
+                    scorer.write().await.get_or_create(addr)
+                        .record_misbehavior(super::scoring::MisbehaviorType::OversizedMessage);
+                }
+                return Ok(());
+            }
+            if let Ok(nf) = borsh::from_slice::<super::protocol::NotFoundMessage>(payload) {
+                if let Err(e) = nf.validate() {
+                    warn!("Invalid NotFound from peer {:?}: {}", &peer_id[..4], e);
+                    if let Some(addr) = peers.get(&peer_id).map(|p| p.addr) {
+                        scorer.write().await.get_or_create(addr)
+                            .record_misbehavior(super::scoring::MisbehaviorType::ProtocolViolation);
+                    }
+                    return Ok(());
+                }
+                let n = nf.hashes.len();
+                {
+                    let mut cache = tx_absence_cache.write();
+                    for h in nf.hashes {
+                        cache.mark_absent(h);
+                    }
+                }
+                debug!("NotFound from peer {:?}: cached {} absent tx hash(es)",
+                       &peer_id[..4], n);
             }
         }
 
@@ -3802,14 +3932,28 @@ async fn process_message(
                     return Ok(());
                 }
                 let mut txs = Vec::new();
+                // v1.0.13 #2 — track which requested hashes we don't
+                // have so we can reply NotFound for them. Pre-fix we
+                // silently dropped misses; peer kept re-asking, we
+                // kept doing mempool.get() per re-ask.
+                let mut absent = Vec::new();
                 for hash in &msg.hashes {
                     if let Some(tx) = mempool.get(hash) {
                         txs.push(tx);
+                    } else {
+                        absent.push(*hash);
                     }
                 }
                 if !txs.is_empty() {
                     if let Some(sender) = senders.get(&peer_id) {
                         if let Ok(resp) = Message::txs(magic, txs) {
+                            let _ = sender.send(resp.to_bytes()?).await;
+                        }
+                    }
+                }
+                if !absent.is_empty() {
+                    if let Some(sender) = senders.get(&peer_id) {
+                        if let Ok(resp) = Message::not_found(magic, absent) {
                             let _ = sender.send(resp.to_bytes()?).await;
                         }
                     }
@@ -4552,6 +4696,49 @@ mod tests {
         let config = NodeConfig::default();
         assert_eq!(config.max_peers, MAX_PEERS);
         assert_eq!(config.max_outbound, MAX_OUTBOUND);
+    }
+
+    // ─── v1.0.13 #2 — TxAbsenceCache ───────────────────────────
+
+    #[test]
+    fn tx_absence_cache_marks_and_reports() {
+        let mut cache = TxAbsenceCache::new();
+        let h1 = crate::primitives::Hash::from_bytes([1u8; 32]);
+        let h2 = crate::primitives::Hash::from_bytes([2u8; 32]);
+
+        assert!(!cache.is_known_absent(&h1));
+        cache.mark_absent(h1);
+        assert!(cache.is_known_absent(&h1));
+        assert!(!cache.is_known_absent(&h2));
+        assert_eq!(cache.len(), 1);
+    }
+
+    #[test]
+    fn tx_absence_cache_hard_cap_evicts_oldest_under_attack() {
+        let mut cache = TxAbsenceCache::new();
+        // Hammer the cache past the 10K cap. Each insert under
+        // cap-pressure should evict the oldest entry, keeping size
+        // at exactly max_size.
+        for i in 0..11_000u32 {
+            let mut bytes = [0u8; 32];
+            bytes[..4].copy_from_slice(&i.to_be_bytes());
+            cache.mark_absent(crate::primitives::Hash::from_bytes(bytes));
+        }
+        assert_eq!(cache.len(), 10_000,
+                   "hard cap must hold under attack-rate inserts");
+
+        // The earliest entry (i=0) should have been evicted.
+        let h0 = {
+            let mut b = [0u8; 32]; b[..4].copy_from_slice(&0u32.to_be_bytes());
+            crate::primitives::Hash::from_bytes(b)
+        };
+        // The most recent (i=10999) should still be there.
+        let h_last = {
+            let mut b = [0u8; 32]; b[..4].copy_from_slice(&10_999u32.to_be_bytes());
+            crate::primitives::Hash::from_bytes(b)
+        };
+        assert!(!cache.is_known_absent(&h0), "oldest entry must have been evicted");
+        assert!(cache.is_known_absent(&h_last), "newest entry must still be present");
     }
 
     #[tokio::test]
