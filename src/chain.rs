@@ -2574,8 +2574,30 @@ inner.stats.total_supply = match inner.stats.total_supply.checked_sub(emission) 
                     };
                     let state_bytes = crate::db::serialize(&new_state)?;
 
-                    // 5. Apply everything atomically
-                    db.apply_reorg_atomic(
+                    // 5. Apply everything atomically.
+                    //
+                    // v1.0.13 #9 — close the "in-memory diverged from DB"
+                    // window on persistence failure.
+                    //
+                    // The in-memory state has ALREADY been mutated to the
+                    // new fork tip (utxos, tip, stats, height_to_hash all
+                    // moved). If apply_reorg_atomic returns Err, in-memory
+                    // is on the new fork but DB still has pre_reorg state.
+                    // The naive `?` propagation leaves in-memory in this
+                    // diverged state until the next successful persist or
+                    // restart.
+                    //
+                    // The fix: on Err, force in-memory back into agreement
+                    // with DB via verify_tip_integrity, which already
+                    // implements the "reload from DB if tip hashes
+                    // differ" path. Since the DB still has pre_reorg state
+                    // (the failed atomic write was a no-op), this rolls
+                    // in-memory back to pre_reorg cleanly.
+                    //
+                    // After reload, return the original error so the caller
+                    // sees "reorg failed" and the block is treated as
+                    // Invalid.
+                    if let Err(persist_err) = db.apply_reorg_atomic(
                         &oi_removals,
                         &oi_additions,
                         &height_sets,
@@ -2583,7 +2605,23 @@ inner.stats.total_supply = match inner.stats.total_supply.checked_sub(emission) 
                         &state_bytes,
                         &ti_adds,
                         &ti_removes,
-                    )?;
+                    ) {
+                        tracing::error!(
+                            "Reorg DB persistence FAILED — in-memory state diverged \
+                             from DB. Forcing reload from DB to restore consistency. \
+                             Original err: {}",
+                            persist_err,
+                        );
+                        if let Err(reload_err) = self.verify_tip_integrity() {
+                            tracing::error!(
+                                "Reload-from-DB after reorg-persist failure ALSO \
+                                 failed: {}. Node state is now inconsistent — \
+                                 operator should restart to recover.",
+                                reload_err,
+                            );
+                        }
+                        return Err(persist_err);
+                    }
 
                     tracing::info!(
                         "Reorg atomic commit: {} outputs removed, {} added, {} heights set",
