@@ -588,7 +588,49 @@ pub fn validate_block_with_checkpoint_for_network(
         }
     }
 
-    // If there are duplicate key images, fail fast before expensive validation
+    // v1.0.12 protocol upgrade (gated by HARD_FORK_V1_0_12_HEIGHT):
+    // reject blocks where two distinct txs create the same stealth
+    // address as an output.
+    //
+    // The dup-stealth check inside `validate_transaction` catches:
+    // (a) duplicates within a single tx via an in-tx HashSet,
+    // (b) clash with any already-on-chain output via
+    // `utxos.get_output_index_entry`. It does NOT catch CROSS-TX-
+    // WITHIN-BLOCK clashes — tx1 and tx2 each create an output with
+    // stealth X, neither X is in the UTXO yet at validation time,
+    // and `validate_transaction` runs in parallel across txs so
+    // they cannot see each other's new outputs.
+    //
+    // Without this check, block-apply would `or_insert` index tx1's
+    // output X and silently drop tx2's output X from
+    // stealth_index/output_index — silent-output-loss + CLSAG
+    // forgery-path via wrong-commitment ring lookup against tx2's
+    // "shadowed" output. Backport of v1.0.12-release commit cfc680b7.
+    //
+    // Strictly tightening: any block accepted under this check is
+    // also acceptable under the pre-fork rules. Honest wallets
+    // generate Diffie-Hellman-derived per-output stealth addresses
+    // (effectively random); no honest block was ever produced with a
+    // clash. Activation deferred until HARD_FORK_V1_0_12_HEIGHT is
+    // set away from u64::MAX in a coordinated deploy.
+    if block.header.height >= crate::constants::HARD_FORK_V1_0_12_HEIGHT {
+        let mut seen_block_outputs = std::collections::HashSet::new();
+        for (tx_idx, tx) in block.transactions.iter().enumerate() {
+            for (out_idx, output) in tx.outputs.iter().enumerate() {
+                let addr_bytes = *output.stealth_address.as_bytes();
+                if !seen_block_outputs.insert(addr_bytes) {
+                    result.add_error(format!(
+                        "Cross-tx duplicate stealth address in block at tx {} output {}",
+                        tx_idx, out_idx
+                    ));
+                }
+            }
+        }
+    }
+
+    // If there are duplicate key images (or cross-tx dup stealth
+    // addresses, post v1.0.12 activation), fail fast before expensive
+    // validation
     if !result.valid {
         return Ok(result);
     }
