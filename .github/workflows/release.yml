@@ -87,36 +87,14 @@ jobs:
         with:
           subject-path: coincync-windows-x64.tar.gz
 
-  build-macos-intel:
-    runs-on: macos-13
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install deps
-        run: brew install cmake
-      - name: Build coincync (node + wallet)
-        run: cargo build --release --features "randomx testnet" --bin coincync-node --bin coincync-wallet
-      - name: Build coincync-rig (canonical retail miner)
-        run: cargo build --release -p coincync-rig
-      - name: Build cyncswap (atomic-swap state-machine CLI; crypto skeleton, see CIP-001)
-        run: cargo build --release -p coincync-swap --bin cyncswap
-      - name: Package
-        run: |
-          mkdir pkg
-          cp target/release/coincync-node target/release/coincync-rig target/release/coincync-wallet target/release/cyncswap pkg/
-          cp deploy/coincync-node.service release/README.md release/coincync.conf.example pkg/
-          cp deploy/ops/verify-community-bootstrap.sh deploy/ops/install-testnet-node.sh pkg/
-          chmod +x pkg/verify-community-bootstrap.sh pkg/install-testnet-node.sh
-          cd pkg && shasum -a 256 * > SHA256SUMS.txt && cd ..
-          tar czf coincync-macos-x64.tar.gz -C pkg .
-      - uses: actions/upload-artifact@v4
-        with:
-          name: coincync-macos-x64
-          path: coincync-macos-x64.tar.gz
-      - name: Attest macOS x64 artifact provenance
-        uses: actions/attest-build-provenance@v4
-        with:
-          subject-path: coincync-macos-x64.tar.gz
+  # Intel macOS (macos-13 runner) removed 2026-06-16: GitHub Actions
+  # has been deprecating macos-13 capacity since late 2025; jobs queue
+  # 24h+ without runner pickup, then time out red. Intel Macs themselves
+  # are EOL (Apple stopped selling 2023, macOS 14+ ARM-only for new
+  # features). All current Apple users are covered by build-macos-arm
+  # below. If x86-64 macOS support is ever needed again, restore this
+  # job with `runs-on: macos-latest` (which will be ARM) + cross-
+  # compilation flags, not a separate Intel runner.
 
   build-macos-arm:
     runs-on: macos-14
@@ -163,7 +141,7 @@ jobs:
   # Runs only when triggered by a tag push OR when workflow_dispatch
   # provides an existing tag in the `version` input.
   publish-release:
-    needs: [build-linux, build-windows, build-macos-intel, build-macos-arm]
+    needs: [build-linux, build-windows, build-macos-arm]
     runs-on: ubuntu-latest
     steps:
       - name: Determine tag
