@@ -1108,10 +1108,47 @@ pub fn validate_transaction(
     // valid under the pre-fork rule. Honest wallets unaffected.
     if current_height >= crate::constants::HARD_FORK_V1_0_12_HEIGHT {
         for (out_idx, output) in tx.outputs.iter().enumerate() {
+            // v1.0.12 #3/8 (cf. commit 9c8633e7): encrypted_amount must be
+            // exactly 8 bytes post-fork.
             if output.encrypted_amount.len() != 8 {
                 return Err(Error::InvalidTransaction(format!(
                     "output {} encrypted_amount must be exactly 8 bytes, got {}",
                     out_idx, output.encrypted_amount.len()
+                )));
+            }
+            // v1.0.12 #4/8 (backport of v1.0.12-release 161fd74f):
+            // per-output size caps at block-level validation.
+            //
+            // Pre-fix, the encrypted_memo size cap lived ONLY in
+            // `validate_transaction_basic` (mempool admission). The main
+            // `validate_transaction` — called by block validation — never
+            // checked it. A miner could include a tx with
+            // encrypted_memo.len() = many KiB in a self-mined block;
+            // block validation let it through.
+            //
+            // Same bug class as the version=0 / MAX_TX_VERSION gap found
+            // 2026-06-03: a check duplicated by accident between the
+            // mempool and block paths drifts at the block path. The
+            // single-source-of-truth refactor for this class lives in
+            // `check_context_free_invariants` on v1.0.13-refactor
+            // (commit 4bd0bca1) and is the longer-term fix; v1.0.12 just
+            // ports the missing cap into validate_transaction here.
+            //
+            // MAX_TX_SIZE caps the overall tx so per-block damage is
+            // bounded, but every honest node pays disk + bandwidth for
+            // the inflated bytes forever, AND the bloated UTXO persists
+            // until the output is spent.
+            //
+            // The matching encrypted_amount > 64 cap from the upstream
+            // 161fd74f commit is INTENTIONALLY OMITTED here: the v1.0.12
+            // tightening to `!= 8` above is strictly stricter than `> 64`,
+            // so the > 64 check is dead code after activation.
+            if output.encrypted_memo.len() > crate::constants::MAX_OUTPUT_MEMO_SIZE {
+                return Err(Error::InvalidTransaction(format!(
+                    "output {} encrypted_memo too large: {} bytes (max {})",
+                    out_idx,
+                    output.encrypted_memo.len(),
+                    crate::constants::MAX_OUTPUT_MEMO_SIZE,
                 )));
             }
         }

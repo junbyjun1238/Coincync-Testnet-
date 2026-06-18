@@ -172,6 +172,17 @@ pub const MTP_WINDOW: usize = 11;
 /// full operator runbook + Discord announcement template.
 pub const HARD_FORK_V1_0_12_HEIGHT: u64 = u64::MAX;
 
+/// Maximum bytes per output's `encrypted_memo` field.
+///
+/// XOR-encrypted ciphertext envelope around a user memo. Honest
+/// wallets pad memos up to this cap via the
+/// MAX_MEMO_SIZE = 256 + MEMO_OVERHEAD constants in src/crypto/memo.rs;
+/// caller code never produces longer payloads. The cap exists to
+/// prevent block-level chain bloat from miner-crafted txs that
+/// bypass mempool admission. v1.0.12 hard-fork enforces this cap at
+/// block-validation time too (see HARD_FORK_V1_0_12_HEIGHT).
+pub const MAX_OUTPUT_MEMO_SIZE: usize = 256;
+
 /// Maximum time in the future a block timestamp may claim (seconds).
 pub const MAX_FUTURE_TIMESTAMP: u64 = 60 * 10;
 
