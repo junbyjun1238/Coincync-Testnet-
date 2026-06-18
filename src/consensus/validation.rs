@@ -453,17 +453,31 @@ pub fn validate_block_with_checkpoint_for_network(
             let mut total_declared: u64 = 0;
             let mut all_valid = true;
 
+            // v1.0.12 audit-follow-up #5 (backport of v1.0.12-release
+            // 3507a1cd): coinbase encrypted_amount must be exactly 8
+            // bytes post-fork. Honest coinbase construction always
+            // emits exactly 8 (LE u64). The pre-fork `>= 8` silently
+            // accepted longer payloads and used only the first 8
+            // bytes — bounded chain bloat that compounds across every
+            // block forever. Tightened at HARD_FORK_V1_0_12_HEIGHT.
+            let v1_0_12_active = block.header.height >= crate::constants::HARD_FORK_V1_0_12_HEIGHT;
             for (idx, output) in coinbase.outputs.iter().enumerate() {
                 // Extract declared amount from encrypted_amount field
                 // (coinbase uses plaintext amount since reward is public)
-                let declared_amount = if output.encrypted_amount.len() >= 8 {
+                let length_ok = if v1_0_12_active {
+                    output.encrypted_amount.len() == 8
+                } else {
+                    output.encrypted_amount.len() >= 8
+                };
+                let declared_amount = if length_ok {
                     let mut bytes = [0u8; 8];
                     bytes.copy_from_slice(&output.encrypted_amount[..8]);
                     u64::from_le_bytes(bytes)
                 } else {
+                    let expected_msg = if v1_0_12_active { "exactly 8 bytes" } else { "8 bytes" };
                     result.add_error(format!(
-                        "Coinbase output {} has invalid amount encoding (expected 8 bytes, got {})",
-                        idx, output.encrypted_amount.len()
+                        "Coinbase output {} has invalid amount encoding (expected {}, got {})",
+                        idx, expected_msg, output.encrypted_amount.len()
                     ));
                     all_valid = false;
                     continue;
@@ -1075,6 +1089,32 @@ pub fn validate_transaction(
     // Must have outputs
     if tx.outputs.is_empty() {
         return Err(Error::InvalidOutputCount { count: 0, max: crate::constants::MAX_TX_OUTPUTS });
+    }
+
+    // v1.0.12 audit-follow-up #4 (backport of v1.0.12-release commit
+    // 3507a1cd): non-coinbase output encrypted_amount must be exactly
+    // 8 bytes post-fork. The XOR-masked u64 design (see
+    // src/crypto/memo.rs) implies exactly 8 bytes; honest wallets
+    // construct it as `vec![0u8; 8]` everywhere (grep
+    // "encrypted_amount: vec" in src/ — 9 sites, all 8 bytes).
+    //
+    // Pre-fork, the `len() > 64` upper bound in
+    // validate_transaction_basic accepted 0..=64, silently letting
+    // malicious miners pad up to 56 surplus bytes per output —
+    // bounded chain bloat that compounds across every UTXO outliving
+    // the tx. Tightened to exact length at activation.
+    //
+    // Strictly tightening: any tx valid under this check is also
+    // valid under the pre-fork rule. Honest wallets unaffected.
+    if current_height >= crate::constants::HARD_FORK_V1_0_12_HEIGHT {
+        for (out_idx, output) in tx.outputs.iter().enumerate() {
+            if output.encrypted_amount.len() != 8 {
+                return Err(Error::InvalidTransaction(format!(
+                    "output {} encrypted_amount must be exactly 8 bytes, got {}",
+                    out_idx, output.encrypted_amount.len()
+                )));
+            }
+        }
     }
 
     // Check input count
