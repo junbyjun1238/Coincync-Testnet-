@@ -1269,6 +1269,64 @@ pub fn validate_transaction(
         }
     }
 
+    // v1.0.12 #5/8 (backport of v1.0.12-release 5aeb27dd): reject
+    // duplicate stealth addresses across this tx's outputs AND
+    // collisions with any existing on-chain output's stealth address.
+    //
+    // Why: `UtxoSet::add_output_ext` indexes outputs by stealth address
+    // via `HashMap::entry().or_insert()` — first-wins semantics chosen
+    // for coinbase-output sharing across heights. For regular Transfer
+    // outputs that becomes a footgun:
+    //
+    //   In-tx case: tx.outputs[0].stealth_address ==
+    //   tx.outputs[1].stealth_address — both OutputRefs land in the
+    //   primary (tx_hash, index) map, but only outputs[0] gets indexed
+    //   in stealth_index / output_index. Every spend-side lookup
+    //   (`get_output_by_stealth`, ring-member commitment-match check at
+    //   line ~1167) returns outputs[0]'s OutputRef + commitment. CLSAG
+    //   verification consults the wrong commitment → silently accepts a
+    //   fabricated ring signature OR silently rejects a valid one,
+    //   depending on the attacker's framing.
+    //
+    //   Cross-tx case: a new output's stealth address matches an
+    //   existing on-chain output's — the new entry is silently dropped
+    //   in stealth_index / output_index. Same lookup poisoning.
+    //
+    // Honest stealth addresses are random (Diffie-Hellman derived
+    // per-output); duplicates only happen via deliberate construction
+    // or broken RNG. Rejecting is safe.
+    //
+    // We check via the permanent `output_index` (retains historical
+    // outputs including spent ones) so a cross-tx clash with any
+    // ever-existed output is caught.
+    //
+    // Strictly tightening: any tx valid post-fork is also valid
+    // pre-fork (under the current loose "first-wins" rule the tx would
+    // have been silently accepted with broken indexing). Honest
+    // wallets unaffected.
+    //
+    // The cross-tx-WITHIN-BLOCK variant (two distinct txs in the same
+    // block each creating an output with the same stealth address) is
+    // covered by item #2/8 (commit 1cc2f1f4) at block-validation level.
+    if current_height >= crate::constants::HARD_FORK_V1_0_12_HEIGHT {
+        let mut seen_outputs_in_tx = std::collections::HashSet::with_capacity(tx.outputs.len());
+        for (out_idx, output) in tx.outputs.iter().enumerate() {
+            let addr_bytes = *output.stealth_address.as_bytes();
+            if !seen_outputs_in_tx.insert(addr_bytes) {
+                return Err(Error::InvalidTransaction(format!(
+                    "duplicate stealth address at output {}",
+                    out_idx,
+                )));
+            }
+            if utxos.get_output_index_entry(&addr_bytes).is_some() {
+                return Err(Error::InvalidTransaction(format!(
+                    "output {} stealth address collides with existing on-chain output",
+                    out_idx,
+                )));
+            }
+        }
+    }
+
     // SECURITY (CRIT-5 + HIGH-4): Validate ring members exist in UTXO set and
     // enforce coinbase maturity. Ring members referencing non-existent outputs
     // could be used to forge ring signatures. Immature coinbase outputs must
