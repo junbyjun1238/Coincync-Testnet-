@@ -1468,7 +1468,64 @@ pub fn validate_transaction(
 
     // Check ring size and duplicate ring members
     for (input_idx, input) in tx.inputs.iter().enumerate() {
-        let available = utxos.output_count();
+        // v1.0.12 #6/8 (backport of v1.0.12-release 1d27d3c8): use
+        // monotonic `total_outputs_ever()` instead of the live
+        // `output_count()` for the ring-size enforcement input.
+        //
+        // ## The bug this fixes
+        //
+        // `output_count()` returns the count of CURRENTLY UNSPENT outputs.
+        // That value (a) decreases as outputs are spent, (b) differs
+        // transiently between nodes mid-reorg as they disconnect chains
+        // at different rates, and (c) differs between archival nodes and
+        // any node running pruning. Below `RING_SIZE_RAMP_TO_FULL_HEIGHT`
+        // (10,000), `effective_ring_size` keys off `available` to compute
+        // the bootstrap-adapt ring size — so two nodes with different
+        // `available` for the same block can REQUIRE DIFFERENT RING SIZES,
+        // accept on one node and reject on the other, and produce a
+        // consensus split.
+        //
+        // ## The fix
+        //
+        // `total_outputs_ever()` is monotonically incremented in
+        // `add_output_ext` and NEVER decremented (the disconnect counter
+        // is separate at `reorg_disconnects_total`). Every node that
+        // processed the same chain prefix has identical values.
+        // Determinism preserved across all node configurations.
+        //
+        // ## Cast safety
+        //
+        // u64 → usize via `as`: on all supported 64-bit targets this is
+        // identity. On hypothetical 32-bit hosts it saturates at
+        // u32::MAX, which is still vastly larger than any target ring
+        // size (≤ 16), so the consensus decision is unaffected.
+        //
+        // ## Why gated despite being a determinism fix
+        //
+        // The flip from `output_count()` to `total_outputs_ever()` is
+        // a hardening, but it IS a consensus rule change: a block that
+        // happened to pass under the buggy formula on node A and fail
+        // on node B might now fail on both. Gating the change at
+        // HARD_FORK_V1_0_12_HEIGHT means every node flips the rule at
+        // the same height; binaries with this code shipped before the
+        // activation height still apply the old (nondeterministic)
+        // logic, exactly matching v1.0.11.x nodes that don't have this
+        // commit at all. No split at deploy time; clean cutover at the
+        // height.
+        //
+        // ## Why this is the v1.0.12 release blocker
+        //
+        // Pre-fork, the buggy formula is non-deterministic — different
+        // node configurations can disagree on ring-size requirements
+        // for the SAME block in the bootstrap window (h < 10,000). The
+        // testnet has been lucky so far (no archival/pruned-node mix
+        // observed live), but mainnet at launch would absolutely have
+        // both. This must activate by mainnet GA (2026-10-01).
+        let available = if current_height >= crate::constants::HARD_FORK_V1_0_12_HEIGHT {
+            utxos.total_outputs_ever() as usize
+        } else {
+            utxos.output_count()
+        };
         let ring_size = crate::constants::effective_ring_size(current_height, available);
         if input.ring_members.len() != ring_size {
             return Err(Error::InvalidRingSize {
