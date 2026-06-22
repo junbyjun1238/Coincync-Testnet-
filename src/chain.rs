@@ -697,7 +697,18 @@ impl Blockchain {
                             for h in 0..=state.height {
                                 if let Some(block) = self.get_block_by_height(h) {
                                     for (idx, tx) in block.transactions.iter().enumerate() {
-                                        let _ = db.index_tx(tx.hash().as_bytes(), h, idx as u32);
+                                        if let Err(e) = db.index_tx(tx.hash().as_bytes(), h, idx as u32) {
+                                            // Don't bail the rebuild on a single tx-index write failure
+                                            // (might be transient disk pressure); log so we know which
+                                            // tx didn't get indexed. Operator can compare `indexed`
+                                            // counter against block.transactions.len() to detect drift.
+                                            tracing::warn!(
+                                                height = h,
+                                                tx_index = idx,
+                                                error = %e,
+                                                "tx_index write failed during chain-state rebuild — entry skipped, lookup will fall back to scan",
+                                            );
+                                        }
                                         indexed += 1;
                                     }
                                 }
@@ -803,7 +814,21 @@ impl Blockchain {
                             total_burned: 0,
                             last_checkpoint,
                         };
-                        let _ = db.state.save_state(&state);
+                        if let Err(e) = db.state.save_state(&state) {
+                            // The chain-truncation warning below tells the operator
+                            // we recovered to good_height; if THIS save_state failed,
+                            // the on-disk state still reflects the BAD pre-truncation
+                            // height — so on next restart we'd re-attempt the same
+                            // truncation. Log the failure so the operator can
+                            // investigate disk health before relying on the recovery
+                            // having persisted. (Pre-fix this error was silently
+                            // dropped via `let _ = ...`.)
+                            tracing::error!(
+                                error = %e,
+                                truncate_height = good_height,
+                                "save_state after chain truncation failed — recovery NOT persisted; expect re-truncate on restart unless disk issue resolved",
+                            );
+                        }
                         tracing::warn!(
                             "Chain truncated to height {}. Node will re-sync missing blocks.",
                             good_height
@@ -1321,7 +1346,17 @@ inner.stats.total_supply = match inner.stats.total_supply.checked_sub(emission) 
                 total_burned: 0,
                 last_checkpoint,
             };
-            let _ = db.state.save_state(&state);
+            if let Err(e) = db.state.save_state(&state) {
+                // Same pattern as the truncation-recovery save_state above:
+                // dropping this error silently leaves on-disk state stale,
+                // and the operator has no visibility into why their
+                // restart-time state doesn't match what they expect.
+                tracing::error!(
+                    error = %e,
+                    rollback_height = state.height,
+                    "save_state after chain rollback failed — on-disk state stale; investigate disk health",
+                );
+            }
         }
 
         tracing::info!(
@@ -1684,7 +1719,21 @@ inner.stats.total_supply = match inner.stats.total_supply.checked_sub(emission) 
                 // Index transactions for O(1) lookup by hash
                 if let Some(ref db) = self.db {
                     for (idx, tx) in block.transactions.iter().enumerate() {
-                        let _ = db.index_tx(tx.hash().as_bytes(), block.header.height, idx as u32);
+                        if let Err(e) = db.index_tx(tx.hash().as_bytes(), block.header.height, idx as u32) {
+                            // Skipping the tx_index entry doesn't break consensus
+                            // (lookups fall back to scan), but silently dropping the
+                            // error masks disk-pressure / corruption that the
+                            // operator should know about. Log per-failure so
+                            // operators can detect a pattern (e.g., disk full
+                            // mid-block-acceptance).
+                            tracing::warn!(
+                                height = block.header.height,
+                                tx_index = idx,
+                                tx_hash = %hex::encode(&tx.hash().as_bytes()[..8]),
+                                error = %e,
+                                "tx_index write failed during block accept — entry skipped, scan-fallback engaged",
+                            );
+                        }
                     }
                 }
 
