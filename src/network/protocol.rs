@@ -48,6 +48,17 @@ pub const MAX_REJECT_DATA_SIZE: usize = 256;
 /// Maximum reject message reason length
 pub const MAX_REJECT_REASON_LENGTH: usize = 256;
 
+/// Maximum reject message `message` field length (the name-of-the-rejected-
+/// message string). Bitcoin protocol convention is ~12 ASCII chars per
+/// message-type name (`block`, `tx`, `getheaders`, `inv`, etc.). 64 gives
+/// comfortable headroom without leaving room for amplification: a malicious
+/// peer crafting a RejectMessage with a 1 GB `message` field would have
+/// triggered the OOM vector that `MAX_REJECT_DATA_SIZE` /
+/// `MAX_REJECT_REASON_LENGTH` already defended the sibling fields against,
+/// but the `message` field was missed in the original validation pass.
+/// Surfaced in the 2026-06-20 audit (item 3 of 18 in backport).
+pub const MAX_REJECT_MESSAGE_LENGTH: usize = 64;
+
 /// Message header
 #[derive(Clone, Debug, BorshSerialize, BorshDeserialize)]
 pub struct MessageHeader {
@@ -537,6 +548,20 @@ pub struct RejectMessage {
 impl RejectMessage {
     /// Validate the message to prevent DoS attacks
     pub fn validate(&self) -> Result<()> {
+        // SECURITY (audit item 3 of 18, 2026-06-20): `message` field bound
+        // added. Was missed in the original validation pass that capped
+        // `reason` and `data`; without this, a peer can craft a
+        // RejectMessage with a 1 GB `message` String, triggering a multi-
+        // GB allocation on Borsh deserialize. Same DoS class as the other
+        // two fields; bound is 64 chars (well above any legitimate
+        // message-type name length).
+        if self.message.len() > MAX_REJECT_MESSAGE_LENGTH {
+            return Err(Error::ProtocolError(format!(
+                "reject message too long: {} > {}",
+                self.message.len(),
+                MAX_REJECT_MESSAGE_LENGTH
+            )));
+        }
         if self.reason.len() > MAX_REJECT_REASON_LENGTH {
             return Err(Error::ProtocolError(format!(
                 "reject reason too long: {} > {}",
@@ -699,5 +724,54 @@ mod tests {
     fn test_version_message() {
         let msg = Message::version(MAINNET_MAGIC, 100, Hash::zero()).unwrap();
         assert_eq!(msg.msg_type().unwrap(), MessageType::Version);
+    }
+
+    // ─── RejectMessage size-cap regression tests ───────────────────────
+
+    /// Legitimate RejectMessage with bounded fields validates OK. Pins
+    /// the happy path so future bound changes don't accidentally reject
+    /// honest peer messages.
+    #[test]
+    fn reject_message_valid_bounds_accepted() {
+        let msg = RejectMessage {
+            message: "block".to_string(),
+            code: 1,
+            reason: "invalid block".to_string(),
+            data: vec![0u8; 32],
+        };
+        assert!(msg.validate().is_ok());
+    }
+
+    /// `message` field over MAX_REJECT_MESSAGE_LENGTH must be rejected
+    /// (DoS defense — without this bound, attacker can craft a 1 GB
+    /// String in `message` and trigger OOM on Borsh deserialize).
+    #[test]
+    fn reject_message_oversized_message_field_rejected() {
+        let msg = RejectMessage {
+            message: "x".repeat(MAX_REJECT_MESSAGE_LENGTH + 1),
+            code: 1,
+            reason: "fine".to_string(),
+            data: vec![],
+        };
+        let err = msg.validate().unwrap_err();
+        assert!(
+            err.to_string().contains("reject message too long"),
+            "expected message-too-long error, got: {}", err,
+        );
+    }
+
+    /// `message` exactly at MAX_REJECT_MESSAGE_LENGTH is accepted —
+    /// pins the boundary (inclusive). A future off-by-one bug that
+    /// changes `>` to `>=` would break legitimate peers using the
+    /// full allowed length.
+    #[test]
+    fn reject_message_at_message_boundary_accepted() {
+        let msg = RejectMessage {
+            message: "x".repeat(MAX_REJECT_MESSAGE_LENGTH),
+            code: 1,
+            reason: "fine".to_string(),
+            data: vec![],
+        };
+        assert!(msg.validate().is_ok());
     }
 }
