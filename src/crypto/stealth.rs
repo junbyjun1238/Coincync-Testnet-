@@ -419,6 +419,18 @@ impl Subaddress {
         data.extend_from_slice(&index.to_le_bytes());
         let sub_scalar = hash_to_scalar(&data);
         let sub_point = SecretScalar::from_scalar(sub_scalar).to_public();
+        // SECURITY: `data` contains the wallet's `view_secret` (the long-lived
+        // private view key). Same cold-boot-residue concern as
+        // `coinbase_stealth_address`'s `secret_input` above — Rust's default
+        // Vec::drop frees but doesn't overwrite, leaving the view-secret
+        // bytes recoverable from freed heap pages until naturally
+        // overwritten. Explicit zeroize closes that window.
+        //
+        // The view_secret is particularly sensitive here because it's used
+        // for EVERY subaddress derivation (operators call this whenever
+        // they generate a new receive address), so this code path is hot
+        // and the cold-boot recovery surface is correspondingly larger.
+        data.zeroize();
 
         // subaddress_spend = spend_public + H(...) * G
         let subaddr_spend_point = spend_point.add(&sub_point);
@@ -722,6 +734,22 @@ pub fn coinbase_stealth_address(
     secret_input.extend_from_slice(miner_secret);
     secret_input.extend_from_slice(&height.to_le_bytes());
     let tx_secret_hash = hash_domain(b"COINCYNC_COINBASE_TX_SECRET", &secret_input);
+    // SECURITY: secret_input contains the miner's long-lived `miner_secret` (the
+    // view-pubkey-derived per-output key derivation seed). Without an explicit
+    // zeroize, Rust's default `Vec<u8>::drop` frees the backing allocation but
+    // does NOT overwrite the bytes — so the miner_secret material can persist
+    // in freed-but-not-yet-reused heap memory until a future allocation
+    // happens to overwrite it. That's the cold-boot / memory-residue attack
+    // window. Sister site at line ~738 already zeroizes its `scalar_input`
+    // (the ECDH shared secret); this site was missed when the pattern was
+    // first established (audit 2026-06-20).
+    //
+    // Prior art: Monero CVE-2020-13837 (Janus attack mitigation pass also
+    // surfaced cold-boot-residue gaps in wallet2.cpp); the fix pattern is
+    // `secure_clear` after every secret-bytes use. CoinCync uses the
+    // `zeroize` crate's `Zeroize` trait which compiles to a `memset` that
+    // the optimizer can't elide (per ZeroizeOnDrop guarantees).
+    secret_input.zeroize();
     let tx_secret_scalar = SecretScalar::from_bytes(*tx_secret_hash.as_bytes());
     let tx_public = tx_secret_scalar.to_public();
 
