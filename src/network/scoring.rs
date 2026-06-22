@@ -45,6 +45,29 @@ pub enum MisbehaviorType {
     /// `STALL_THRESHOLD` consecutive `Full` errors. Penalty scored so the
     /// same peer can't immediately reconnect and resume the same pattern.
     ChronicSendQueueFull,
+    /// Peer is flooding us with valid-but-low-fee transactions that we
+    /// reject at the mempool admission gate (`MIN_FEE_PER_BYTE`).
+    ///
+    /// This is the gray zone between "honest peer relaying genuinely-valid
+    /// txs" and "DoS attacker spamming us with cheap txs hoping some land
+    /// during a low-mempool window." We can't ban for "low fee" alone
+    /// (it's not the peer's job to enforce our local fee floor), but
+    /// SUSTAINED relay of below-floor txs is bandwidth waste at best and
+    /// a DoS amplification vector at worst (network bandwidth + tx-
+    /// validation CPU spent rejecting things we already know we'll
+    /// reject).
+    ///
+    /// Penalty: 1pt per offense. Ban after ~50 sustained flood events.
+    /// This is intentionally LOWER than `InvalidTransaction` (25pt)
+    /// because low-fee txs are technically valid — penalty is for the
+    /// pattern, not the message. A peer that relays one low-fee tx
+    /// every few minutes is fine; one that relays 100/sec gets banned.
+    ///
+    /// Prior art: Bitcoin Core's `fee filter` (BIP 133) lets peers
+    /// negotiate a per-peer fee floor so this class of spam never
+    /// reaches the receiver. CoinCync doesn't have BIP 133 yet; until
+    /// it lands, this scoring is the defense.
+    LowFeeFlood,
 }
 
 impl MisbehaviorType {
@@ -81,6 +104,11 @@ impl MisbehaviorType {
             // them; this penalty (2 strikes -> ban) ensures they don't
             // immediately reconnect and re-occupy a peer slot.
             MisbehaviorType::ChronicSendQueueFull => 25,
+            // Low-fee flood — minor (50 offenses → ban). Lower than
+            // InvalidTransaction because low-fee txs are technically
+            // valid; we penalize the SUSTAINED pattern, not individual
+            // messages.
+            MisbehaviorType::LowFeeFlood => 1,
         }
     }
 }
@@ -157,8 +185,19 @@ pub fn classify_invalid_tx_reason(reason: &str) -> MisbehaviorType {
         return MisbehaviorType::ProtocolViolation;
     }
 
-    // Default for tx-level rejections: structural, fee-floor, version, body
-    // crypto. All are honest-node-catchable, so the peer that relayed it
+    // Fee-floor rejections: tx is technically valid but below our local
+    // `MIN_FEE_PER_BYTE` floor. Score as LowFeeFlood (1pt) not
+    // InvalidTransaction (25pt) — the tx isn't malformed, it's just below
+    // our policy threshold. Sustained flood (50+ events) still bans the
+    // peer; one-offs are tolerated as legitimate "let me try" relay.
+    // Until BIP 133 fee-filter lands, this is the defense against
+    // low-fee-tx spam DoS.
+    if r.contains("fee too low") || r.contains("below fee floor") || r.contains("min fee") {
+        return MisbehaviorType::LowFeeFlood;
+    }
+
+    // Default for tx-level rejections: structural, version, body crypto.
+    // All are honest-node-catchable, so the peer that relayed it
     // misbehaved.
     MisbehaviorType::InvalidTransaction
 }
@@ -1092,13 +1131,18 @@ mod tests {
 
     #[test]
     fn classify_tx_default_is_invalid_transaction() {
-        // validate_transaction_basic errors: version, empty in/out, fee floor,
+        // validate_transaction_basic errors: version, empty in/out,
         // size-too-small. All map to InvalidTransaction.
+        //
+        // 2026-06-22: removed "fee below floor" from this list — fee-floor
+        // rejections now classify as LowFeeFlood (1pt) rather than
+        // InvalidTransaction (25pt) per audit item 5 of 18. See the
+        // `classify_tx_fee_floor_is_low_fee_flood` test below for the
+        // new classification.
         for r in [
             "Invalid tx version: 0",
             "transaction has no inputs",
             "transaction has no outputs",
-            "fee below floor",
             "Transaction too small: 50 bytes (min 100)",
             "something we haven't seen yet",
             "",
@@ -1109,6 +1153,34 @@ mod tests {
                 "reason: {}", r,
             );
         }
+    }
+
+    /// Fee-floor rejections map to LowFeeFlood (1pt) so honest peers
+    /// that occasionally relay below-floor txs aren't aggressively
+    /// penalized, while sustained low-fee-spam flooders accumulate
+    /// to the ban threshold over ~50 offenses.
+    #[test]
+    fn classify_tx_fee_floor_is_low_fee_flood() {
+        for r in [
+            "fee too low: 100 < min 1000",
+            "below fee floor",
+            "tx min fee not met",
+        ] {
+            assert_eq!(
+                classify_invalid_tx_reason(r),
+                MisbehaviorType::LowFeeFlood,
+                "reason: {}", r,
+            );
+        }
+    }
+
+    /// LowFeeFlood penalty is set so ~50 offenses ban a peer. Pinning
+    /// the penalty value so a future tweak ("let's bump to 5pt because
+    /// the network is being spammed") is a deliberate change, not a
+    /// silent regression that bans honest peers after 10 events.
+    #[test]
+    fn low_fee_flood_penalty_pinned_at_1() {
+        assert_eq!(MisbehaviorType::LowFeeFlood.penalty(), 1);
     }
 
     #[test]
