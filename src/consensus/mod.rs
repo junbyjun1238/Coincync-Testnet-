@@ -54,8 +54,8 @@ pub use difficulty::{
 // M-1: finality module is dead code; re-exports removed.
 pub use validation::{
     validate_block, validate_block_with_checkpoint, validate_block_with_checkpoint_for_network,
-    validate_transaction, validate_transaction_basic,
-    BlockValidation,
+    validate_transaction, validate_transaction_basic, validate_transaction_for_network,
+    v1_0_12_rules_active, BlockValidation,
 };
 pub(crate) use validation::{verify_output_range_proofs, verify_balance_proof, verify_ring_signature};
 
